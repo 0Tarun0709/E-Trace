@@ -29,15 +29,16 @@ DATA_PATH = r"/Users/tarun/Desktop/Sic/HWC-one-Nighter/corrected_tracking_data.j
 
 CAMERA_CONFIG = {
     "referencePoint": {"lat": -1.2921, "lng": 34.7617},  # Masai Mara coordinates
-    "scale": {"metersPerUnit": 1}  # 1 unit = 1 meter
+    "scale": {"metersPerUnit": 1}  # 1 unit = 1 meter for proper scaling
 }
 
 # Boundary configuration (square boundary in local coordinates)
+# Center at (0, 0) which will be our reference point
 BOUNDARY_CONFIG = {
     "enabled": True,
     "type": "square",
-    "center": {"x": 200, "y": 250},  # Center of the boundary in local coordinates
-    "size": 100,  # Square size (100x100 meters) - appropriate for detailed tracking
+    "center": {"x": 0, "y": 0},  # Center at reference point (0,0)
+    "size": 500,  # Square size (500 meters) - visible boundary around elephants
     "alert_zone_name": "Restricted Area"
 }
 
@@ -170,10 +171,26 @@ async def process_tracking_frames():
     frame_count = 0
     logger.info("Starting real elephant data streaming...")
     
-    # Send initial complete dataset to clients
+    # Send initial complete dataset to clients with coordinate translation
+    translated_frames = []
+    for frame in tracking_data.get('frames', []):
+        translated_frame = {**frame}  # Copy frame data
+        if 'objects' in frame:
+            translated_objects = []
+            for obj in frame['objects']:
+                translated_obj = {**obj}  # Copy object data
+                # Apply same coordinate translation as real-time streaming
+                raw_x = obj.get('x', 0)
+                raw_y = obj.get('y', 0)
+                translated_obj['x'] = (raw_x - 800) * 10  # Larger offset for visibility (in meters)
+                translated_obj['y'] = (raw_y - 500) * 10  # Larger offset for visibility (in meters)
+                translated_objects.append(translated_obj)
+            translated_frame['objects'] = translated_objects
+        translated_frames.append(translated_frame)
+    
     complete_dataset = {
         "metadata": tracking_data.get('metadata', {}),
-        "frames": tracking_data.get('frames', [])
+        "frames": translated_frames
     }
     
     await broadcast_to_all_clients({
@@ -212,8 +229,13 @@ async def process_tracking_frames():
             if 'objects' in current_frame_data:
                 for obj in current_frame_data['objects']:
                     elephant_id = str(obj.get('id', 'elephant_1'))  # Ensure string ID
-                    x = obj.get('x', 0)
-                    y = obj.get('y', 0)
+                    raw_x = obj.get('x', 0)
+                    raw_y = obj.get('y', 0)
+                    
+                    # Translate coordinates to center around boundary (0,0)
+                    # Use larger offsets for better visibility on map
+                    x = (raw_x - 800) * 10  # Larger offset in meters
+                    y = (raw_y - 500) * 10  # Larger offset in meters
                     
                     # Check if elephant is in boundary
                     in_boundary = is_in_boundary(x, y)
