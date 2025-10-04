@@ -94,8 +94,9 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
   const boundaryRef = useRef<L.Polygon | null>(null);
   const boundaryCircleRef = useRef<L.Circle | null>(null);
   const lastModeRef = useRef('');
+  const hasFitBoundsRef = useRef(false);
 
-  // Initialize map
+  // Initialize map (run once)
   useEffect(() => {
     if (mapContainerRef.current && !mapRef.current) {
       mapRef.current = L.map(mapContainerRef.current).setView([-1.2921, 34.7617], 13);
@@ -103,14 +104,6 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
       L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
         attribution: '© OpenStreetMap contributors'
       }).addTo(mapRef.current);
-
-      // Add click handler
-      if (onLocationClick) {
-        mapRef.current.on('click', (e) => {
-          const { lat, lng } = e.latlng;
-          onLocationClick(lat, lng);
-        });
-      }
     }
 
     return () => {
@@ -119,7 +112,45 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
         mapRef.current = null;
       }
     };
+  }, []);
+
+  // Update click handler when callback changes without destroying the map
+  useEffect(() => {
+    if (!mapRef.current) return;
+    mapRef.current.off('click');
+    if (onLocationClick) {
+      mapRef.current.on('click', (e: L.LeafletMouseEvent) => {
+        const { lat, lng } = e.latlng;
+        onLocationClick(lat, lng);
+      });
+    }
   }, [onLocationClick]);
+
+  // Ensure Leaflet recalculates size after mount to avoid invisible tiles
+  useEffect(() => {
+    if (mapRef.current) {
+      // Defer to next tick in case parent layout is not settled yet
+      setTimeout(() => {
+        mapRef.current && mapRef.current.invalidateSize();
+      }, 0);
+    }
+  }, []);
+
+  // Reset fit-bounds flag whenever data source changes
+  useEffect(() => {
+    hasFitBoundsRef.current = false;
+  }, [trackingData, frameBasedData]);
+
+  // Invalidate size on window resize
+  useEffect(() => {
+    const onResize = () => {
+      if (mapRef.current) {
+        mapRef.current.invalidateSize();
+      }
+    };
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
 
   // UNIFIED effect to handle both initialization and animation
   useEffect(() => {
@@ -436,8 +467,8 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
           console.log(`🐘 Elephant ${elephantId} updated:`, isInBoundary ? 'RED (in boundary)' : 'normal', `with ${finalTrail.length} trail points`);
         });
 
-        // 6. Fit bounds only when not animating
-        if (!isAnimating) {
+        // 6. Fit bounds only once per dataset load (avoid flicker on pause/updates)
+        if (!hasFitBoundsRef.current) {
           const boundCoords: [number, number][] = [];
           elephantPathsRef.current.forEach((path) => {
             boundCoords.push(...path);
@@ -447,6 +478,7 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
           }
           const group = L.featureGroup(boundCoords.map(coord => L.marker(coord)));
           mapRef.current.fitBounds(group.getBounds().pad(0.1));
+          hasFitBoundsRef.current = true;
         }
         
         console.log(`✅ UPDATED: Multi-elephant tracking (${elephantGroups.size} elephants), Objects: ${visibleObjectCount}`);
@@ -454,6 +486,12 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
 
     } catch (error: any) {
       console.error('Error updating tracking data:', error);
+    }
+    // After updates, make sure Leaflet recalculates size in case layout changed
+    if (mapRef.current) {
+      setTimeout(() => {
+        mapRef.current && mapRef.current.invalidateSize();
+      }, 0);
     }
   }, [trackingData, frameBasedData, isAnimating, currentPointIndex, boundaryData, elephantsInBoundary]);
 

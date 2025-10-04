@@ -19,6 +19,9 @@ function App() {
   // Boundary violation tracking
   const [boundaryAlerts, setBoundaryAlerts] = useState<string[]>([])
   const [elephantsOutsideBoundary, setElephantsOutsideBoundary] = useState<Set<string>>(new Set())
+  // Map viewport controls
+  const [autoFitEnabled, setAutoFitEnabled] = useState(false)
+  const [fitNowVersion, setFitNowVersion] = useState(0)
   
   // Elephant position tracking for E1 and E2
   const [elephantPositions, setElephantPositions] = useState<{
@@ -224,6 +227,9 @@ function App() {
         currentPointIndex={currentPointIndex}
         isAnimating={isPlaying}
         isRealTime={false}
+        onPositionUpdate={handlePositionUpdate}
+        autoFitEnabled={autoFitEnabled}
+        fitNowVersion={fitNowVersion}
       />
       
 
@@ -334,6 +340,33 @@ function App() {
               {/* Progress */}
               <div style={{ fontSize: '12px', color: '#666', marginBottom: '10px' }}>
                 Progress: {currentPointIndex} / {totalPoints} points
+              </div>
+
+              {/* Map Viewport */}
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '10px' }}>
+                <label style={{ display: 'flex', alignItems: 'center', fontSize: '12px', color: '#374151' }}>
+                  <input
+                    type="checkbox"
+                    checked={autoFitEnabled}
+                    onChange={(e) => setAutoFitEnabled(e.target.checked)}
+                    style={{ marginRight: '6px' }}
+                  />
+                  Auto-fit map to elephants
+                </label>
+                <button
+                  onClick={() => setFitNowVersion(v => v + 1)}
+                  style={{
+                    padding: '4px 8px',
+                    backgroundColor: '#2563eb',
+                    color: 'white',
+                    border: 'none',
+                    borderRadius: '4px',
+                    cursor: 'pointer',
+                    fontSize: '12px'
+                  }}
+                >
+                  Fit now
+                </button>
               </div>
 
               {/* Trail Toggle */}
