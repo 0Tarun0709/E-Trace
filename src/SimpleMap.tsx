@@ -64,6 +64,8 @@ interface SimpleMapProps {
   boundaryData?: BoundaryConfig;
   elephantsInBoundary?: string[];
   onLocationClick?: (lat: number, lng: number) => void;
+  onBoundaryViolation?: (elephantId: string, isViolation: boolean, coordinates: { x: number, y: number }) => void;
+  onPositionUpdate?: (elephantId: string, coordinates: { x: number, y: number }, timestamp?: number) => void;
   isAnimating?: boolean;
   currentPointIndex?: number;
 }
@@ -72,6 +74,8 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
   trackingData,
   frameBasedData,
   onLocationClick,
+  onBoundaryViolation,
+  onPositionUpdate,
   isAnimating = false,
   currentPointIndex = 0,
   isRealTime = false,
@@ -149,9 +153,10 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
       referencePoint = cameraConfig.referencePoint;
       scale = cameraConfig.scale;
       
-      // Convert frame-based to object-based for animation
-      const allObjects: FrameObject[] = [];
-      const maxFrames = isAnimating ? Math.min(currentPointIndex + 1, frames.length) : frames.length;
+  // Convert frame-based to object-based for animation
+  const allObjects: FrameObject[] = [];
+  // Always limit by currentPointIndex to ensure pause doesn't jump to end
+  const maxFrames = Math.min(currentPointIndex + 1, frames.length);
       
       for (let i = 0; i < maxFrames; i++) {
         const frame = frames[i];
@@ -169,10 +174,19 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
         objects: allObjects
       };
     } else if (trackingData) {
-      // Static tracking data
-      currentData = trackingData;
+      // Static tracking data with animation limiting
       referencePoint = trackingData.referencePoint;
       scale = trackingData.scale;
+
+      // Always limit objects based on animation progress
+      const maxObjects = Math.min(currentPointIndex + 1, trackingData.objects.length);
+      const visibleObjects = trackingData.objects.slice(0, maxObjects);
+
+      currentData = {
+        referencePoint,
+        scale,
+        objects: visibleObjects
+      };
     } else {
       return; // No data available
     }
@@ -233,8 +247,8 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
       // Removed distance calculation - no longer needed for trail logic
 
       if (currentData.objects.length > 0) {
-        // Determine how many objects to show based on animation
-        const visibleObjectCount = isAnimating ? Math.min(currentPointIndex + 1, currentData.objects.length) : currentData.objects.length;
+  // Determine how many objects to show based on animation (independent of play/pause)
+  const visibleObjectCount = Math.min(currentPointIndex + 1, currentData.objects.length);
         const visibleObjects = currentData.objects.slice(0, visibleObjectCount);
         
         console.log(`📍 Processing objects: ${visibleObjectCount}/${currentData.objects.length}`);
@@ -246,6 +260,7 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
         markersRef.current.push(refMarker);
 
         // 1.1. Add green boundary circle (500m radius)
+        // CHANGE CIRCLE CENTER LOCATION
         boundaryCircleRef.current = L.circle([referencePoint.lat, referencePoint.lng+0.031], {
           color: '#22c55e',
           weight: 3,
@@ -329,6 +344,30 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
           const currentObj = elephantObjects[elephantObjects.length - 1];
           const currentCoords = localToLatLng(currentObj.x, currentObj.y);
           const currentPoint = [currentCoords.lat, currentCoords.lng] as [number, number];
+          
+          // Check boundary violation (500m radius from reference point)
+          if (onBoundaryViolation) {
+            // Use the same coordinate transformation as the coordinate system
+            // The coordinate system translates: (raw_x - 800) * 10 for meters
+            const transformedX = (currentObj.x - 800) * 10; // meters from center
+            const transformedY = (currentObj.y - 500) * 10; // meters from center (assuming y center ~500)
+            
+            const distanceFromCenter = Math.sqrt(
+              Math.pow(transformedX, 2) + Math.pow(transformedY, 2)
+            );
+            
+            const isOutsideBoundary = distanceFromCenter > 500; // 500m radius
+            
+            // Debug logging
+            console.log(`🐘 ${elephantId}: pos(${currentObj.x}, ${currentObj.y}) -> transformed(${transformedX.toFixed(1)}, ${transformedY.toFixed(1)}) -> distance: ${distanceFromCenter.toFixed(1)}m, outside: ${isOutsideBoundary}`);
+            
+            onBoundaryViolation(elephantId, isOutsideBoundary, { x: currentObj.x, y: currentObj.y });
+          }
+          
+          // Update position for E1 and E2 tracking
+          if (onPositionUpdate) {
+            onPositionUpdate(elephantId, { x: currentObj.x, y: currentObj.y }, currentObj.timestamp);
+          }
           
           // Remove existing trail for this elephant
           if (elephantTrailsRef.current.has(elephantId) && mapRef.current) {

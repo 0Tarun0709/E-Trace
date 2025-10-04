@@ -15,6 +15,16 @@ function App() {
   const [currentPointIndex, setCurrentPointIndex] = useState(0)
   const [animationSpeed, setAnimationSpeed] = useState(10) // seconds between points
   const [totalPoints, setTotalPoints] = useState(0)
+  
+  // Boundary violation tracking
+  const [boundaryAlerts, setBoundaryAlerts] = useState<string[]>([])
+  const [elephantsOutsideBoundary, setElephantsOutsideBoundary] = useState<Set<string>>(new Set())
+  
+  // Elephant position tracking for E1 and E2
+  const [elephantPositions, setElephantPositions] = useState<{
+    elephant_1?: { x: number, y: number, timestamp?: number }
+    elephant_2?: { x: number, y: number, timestamp?: number }
+  }>({})
 
 
 
@@ -26,6 +36,41 @@ function App() {
 
 
 
+
+  // Position update handler for E1 and E2
+  const handlePositionUpdate = (elephantId: string, coordinates: { x: number, y: number }, timestamp?: number) => {
+    if (elephantId === 'elephant_1' || elephantId === 'elephant_2') {
+      setElephantPositions(prev => ({
+        ...prev,
+        [elephantId]: { x: coordinates.x, y: coordinates.y, timestamp }
+      }))
+    }
+  }
+  
+  // Boundary violation alert handler
+  const handleBoundaryViolation = (elephantId: string, isViolation: boolean, coordinates: { x: number, y: number }) => {
+    const wasOutside = elephantsOutsideBoundary.has(elephantId)
+    
+    if (isViolation && !wasOutside) {
+      // Elephant just left the boundary
+      setElephantsOutsideBoundary(prev => new Set([...prev, elephantId]))
+      const alertMessage = `🚨 ALERT: ${elephantId} has left the safe zone at position (${coordinates.x.toFixed(1)}, ${coordinates.y.toFixed(1)})`
+      setBoundaryAlerts(prev => [...prev.slice(-4), alertMessage]) // Keep last 5 alerts
+      setMessage(alertMessage)
+      console.warn(alertMessage)
+    } else if (!isViolation && wasOutside) {
+      // Elephant returned to the boundary
+      setElephantsOutsideBoundary(prev => {
+        const newSet = new Set(prev)
+        newSet.delete(elephantId)
+        return newSet
+      })
+      const returnMessage = `✅ ${elephantId} has returned to the safe zone`
+      setBoundaryAlerts(prev => [...prev.slice(-4), returnMessage])
+      setMessage(returnMessage)
+      console.log(returnMessage)
+    }
+  }
 
   // Function to load elephant tracking data from JSON file
   const loadElephantTrackingData = async () => {
@@ -119,8 +164,11 @@ function App() {
 
   // Animation control functions
   const startAnimation = () => {
+    // If at the end, restart from beginning, otherwise resume from current position
+    if (currentPointIndex >= totalPoints) {
+      setCurrentPointIndex(0)
+    }
     setIsPlaying(true)
-    setCurrentPointIndex(0)
   }
 
   const pauseAnimation = () => {
@@ -303,11 +351,40 @@ function App() {
         </div>
       )}
 
+      {/* Boundary Alerts Display */}
+      {boundaryAlerts.length > 0 && (
+        <div style={{
+          position: 'absolute',
+          top: '80px',
+          right: '20px',
+          backgroundColor: 'rgba(0, 0, 0, 0.9)',
+          color: 'white',
+          padding: '12px',
+          borderRadius: '8px',
+          zIndex: 1000,
+          fontSize: '13px',
+          maxWidth: '300px',
+          maxHeight: '200px',
+          overflowY: 'auto'
+        }}>
+          <h4 style={{ margin: '0 0 8px 0', fontSize: '14px', fontWeight: 'bold' }}>🚨 Boundary Alerts</h4>
+          {boundaryAlerts.slice(-5).map((alert, index) => (
+            <div key={index} style={{ 
+              marginBottom: '4px', 
+              paddingBottom: '4px',
+              borderBottom: index < boundaryAlerts.slice(-5).length - 1 ? '1px solid #444' : 'none'
+            }}>
+              {alert}
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Error Display */}
       {error && (
         <div style={{
           position: 'absolute',
-          top: '80px',
+          top: boundaryAlerts.length > 0 ? '320px' : '80px',
           right: '20px',
           backgroundColor: 'rgba(255, 0, 0, 0.9)',
           color: 'white',
@@ -320,19 +397,87 @@ function App() {
         </div>
       )}
 
-      {/* Status Message */}
+      {/* E1 & E2 Position Tracker */}
       <div style={{
         position: 'absolute',
         bottom: '20px',
         left: '20px',
-        backgroundColor: 'rgba(255, 255, 255, 0.9)',
-        padding: '10px',
-        borderRadius: '8px',
-        border: '1px solid #ddd',
+        backgroundColor: 'rgba(0, 0, 0, 0.85)',
+        color: 'white',
+        padding: '16px',
+        borderRadius: '12px',
+        border: '2px solid #374151',
+        boxShadow: '0 4px 12px rgba(0,0,0,0.25)',
         zIndex: 1000,
-        fontSize: '14px'
+        fontSize: '14px',
+        minWidth: '300px',
+        fontFamily: 'monospace'
       }}>
-        {message}
+        <div style={{ 
+          fontSize: '16px', 
+          fontWeight: 'bold',
+          marginBottom: '12px',
+          color: '#10b981',
+          textAlign: 'center'
+        }}>
+          🐘 Live Position Tracker
+        </div>
+        
+        {/* Elephant 1 Position */}
+        <div style={{ 
+          marginBottom: '10px',
+          padding: '8px 12px',
+          backgroundColor: 'rgba(239, 68, 68, 0.2)',
+          borderRadius: '8px',
+          border: '1px solid #ef4444'
+        }}>
+          <div style={{ fontWeight: 'bold', color: '#ef4444', marginBottom: '4px' }}>🐘 Elephant 1</div>
+          {elephantPositions.elephant_1 ? (
+            <>
+              <div>X: {elephantPositions.elephant_1.x.toFixed(1)}</div>
+              <div>Y: {elephantPositions.elephant_1.y.toFixed(1)}</div>
+              <div style={{ fontSize: '12px', color: '#9ca3af' }}>
+                Status: {elephantsOutsideBoundary.has('elephant_1') ? '🚨 Outside' : '✅ Safe'}
+              </div>
+            </>
+          ) : (
+            <div style={{ color: '#9ca3af', fontStyle: 'italic' }}>No data</div>
+          )}
+        </div>
+        
+        {/* Elephant 2 Position */}
+        <div style={{ 
+          marginBottom: '8px',
+          padding: '8px 12px',
+          backgroundColor: 'rgba(59, 130, 246, 0.2)',
+          borderRadius: '8px',
+          border: '1px solid #3b82f6'
+        }}>
+          <div style={{ fontWeight: 'bold', color: '#3b82f6', marginBottom: '4px' }}>� Elephant 2</div>
+          {elephantPositions.elephant_2 ? (
+            <>
+              <div>X: {elephantPositions.elephant_2.x.toFixed(1)}</div>
+              <div>Y: {elephantPositions.elephant_2.y.toFixed(1)}</div>
+              <div style={{ fontSize: '12px', color: '#9ca3af' }}>
+                Status: {elephantsOutsideBoundary.has('elephant_2') ? '🚨 Outside' : '✅ Safe'}
+              </div>
+            </>
+          ) : (
+            <div style={{ color: '#9ca3af', fontStyle: 'italic' }}>No data</div>
+          )}
+        </div>
+        
+        {/* Quick Stats */}
+        <div style={{ 
+          fontSize: '11px', 
+          color: '#9ca3af', 
+          textAlign: 'center',
+          marginTop: '8px',
+          paddingTop: '8px',
+          borderTop: '1px solid #374151'
+        }}>
+          Boundary Violations: {elephantsOutsideBoundary.size}/2
+        </div>
       </div>
     </div>
   )
