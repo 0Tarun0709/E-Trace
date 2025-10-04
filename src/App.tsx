@@ -46,6 +46,14 @@ function App() {
     elephant_1?: { x: number, y: number, timestamp?: number }
     elephant_2?: { x: number, y: number, timestamp?: number }
   }>({})
+  // Map actual tracker IDs to UI labels (elephant_1 / elephant_2)
+  const [idToLabel, setIdToLabel] = useState<Map<string, 'elephant_1' | 'elephant_2'>>(new Map())
+
+  const resetElephantUiState = () => {
+    setElephantPositions({})
+    setElephantsOutsideBoundary(new Set())
+    setIdToLabel(new Map())
+  }
 
 
 
@@ -60,33 +68,56 @@ function App() {
 
   // Position update handler for E1 and E2
   const handlePositionUpdate = (elephantId: string, coordinates: { x: number, y: number }, timestamp?: number) => {
-    if (elephantId === 'elephant_1' || elephantId === 'elephant_2') {
-      setElephantPositions(prev => ({
-        ...prev,
-        [elephantId]: { x: coordinates.x, y: coordinates.y, timestamp }
-      }))
+    // Resolve or assign a UI label for this ID
+    let label = idToLabel.get(elephantId)
+    if (!label) {
+      // Assign first available label
+      const used = new Set(idToLabel.values())
+      if (!used.has('elephant_1')) label = 'elephant_1'
+      else if (!used.has('elephant_2')) label = 'elephant_2'
+      if (label) {
+        setIdToLabel(prev => new Map(prev).set(elephantId, label!))
+      } else {
+        // Already tracking two; ignore additional IDs
+        return
+      }
     }
+    setElephantPositions(prev => ({
+      ...prev,
+      [label!]: { x: coordinates.x, y: coordinates.y, timestamp }
+    }))
   }
   
   // Boundary violation alert handler
   const handleBoundaryViolation = (elephantId: string, isViolation: boolean, coordinates: { x: number, y: number }) => {
     const wasOutside = elephantsOutsideBoundary.has(elephantId)
-    
-    if (isViolation && !wasOutside) {
+    // Map to UI label if possible
+    let label = idToLabel.get(elephantId)
+    if (!label) {
+      const used = new Set(idToLabel.values())
+      if (!used.has('elephant_1')) label = 'elephant_1'
+      else if (!used.has('elephant_2')) label = 'elephant_2'
+      if (label) setIdToLabel(prev => new Map(prev).set(elephantId, label!))
+    }
+    const key = label || elephantId
+
+    if (isViolation && !elephantsOutsideBoundary.has(key)) {
       // Elephant just left the boundary
-      setElephantsOutsideBoundary(prev => new Set([...prev, elephantId]))
-      const alertMessage = `🚨 ALERT: ${elephantId} has left the safe zone at position (${coordinates.x.toFixed(1)}, ${coordinates.y.toFixed(1)})`
+      setElephantsOutsideBoundary(prev => new Set([...prev, key]))
+      const alertName = label || elephantId
+      const alertMessage = `🚨 ALERT: ${alertName} has left the safe zone at position (${coordinates.x.toFixed(1)}, ${coordinates.y.toFixed(1)})`
       setBoundaryAlerts(prev => [...prev.slice(-4), alertMessage]) // Keep last 5 alerts
       setMessage(alertMessage)
       console.warn(alertMessage)
-    } else if (!isViolation && wasOutside) {
+    } else if (!isViolation && elephantsOutsideBoundary.has(key)) {
       // Elephant returned to the boundary
       setElephantsOutsideBoundary(prev => {
         const newSet = new Set(prev)
-        newSet.delete(elephantId)
+        newSet.delete(key)
         return newSet
       })
-      const returnMessage = `✅ ${elephantId} has returned to the safe zone`
+      const alertName = label || elephantId
+      const returnMessage = `✅ ${alertName} has returned to the safe zone`
       setBoundaryAlerts(prev => [...prev.slice(-4), returnMessage])
       setMessage(returnMessage)
       console.log(returnMessage)
@@ -203,6 +234,7 @@ function App() {
       setRealtimeActive(true)
       setRealtimeStatus('connecting')
       setFrameBasedData(null)
+      resetElephantUiState()
       setIsPlaying(false)
       setCurrentPointIndex(0)
       return
@@ -228,6 +260,7 @@ function App() {
       setRealtimeActive(false)
       setRealtimeStatus('idle')
       setFrameBasedData(null)
+      resetElephantUiState()
     }
     setIsPlaying(false)
     setCurrentPointIndex(0)
@@ -408,6 +441,7 @@ function App() {
                       setCurrentPointIndex(0)
                       setRealtimeActive(false)
                       setRealtimeStatus('idle')
+                      resetElephantUiState()
                       if (!on) setFrameBasedData(null)
                     }}
                     style={{ marginRight: '6px' }}
