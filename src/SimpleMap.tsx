@@ -66,6 +66,7 @@ interface SimpleMapProps {
   onLocationClick?: (lat: number, lng: number) => void;
   onBoundaryViolation?: (elephantId: string, isViolation: boolean, coordinates: { x: number, y: number }) => void;
   onPositionUpdate?: (elephantId: string, coordinates: { x: number, y: number }, timestamp?: number) => void;
+  onCircleEntry?: (elephantId: string, circleId: string) => void;
   isAnimating?: boolean;
   currentPointIndex?: number;
   // Viewport controls
@@ -73,6 +74,10 @@ interface SimpleMapProps {
   fitNowVersion?: number;
   // Unified boundary radius (meters) used both for circle and violation logic
   boundaryRadiusMeters?: number;
+  // Optional boundary center (lat/lng). Defaults to referencePoint if not provided
+  boundaryCenterLatLng?: { lat: number; lng: number };
+  // Multiple boundary circles support
+  boundaryCircles?: Array<{ id: string; center: { lat: number; lng: number }; radius: number }>;
 }
 
 const SimpleMap: React.FC<SimpleMapProps> = ({ 
@@ -81,6 +86,7 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
   onLocationClick,
   onBoundaryViolation,
   onPositionUpdate,
+  onCircleEntry,
   isAnimating = false,
   currentPointIndex = 0,
   isRealTime = false,
@@ -88,7 +94,9 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
   elephantsInBoundary = [],
   autoFitEnabled = false,
   fitNowVersion,
-  boundaryRadiusMeters = 500
+  boundaryRadiusMeters = 500,
+  boundaryCenterLatLng,
+  boundaryCircles
 }) => {
   const mapRef = useRef<L.Map | null>(null);
   const mapContainerRef = useRef<HTMLDivElement>(null);
@@ -101,6 +109,9 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
   const elephantStartMarkersRef = useRef<Map<string, L.Marker>>(new Map());
   const boundaryRef = useRef<L.Polygon | null>(null);
   const boundaryCircleRef = useRef<L.Circle | null>(null);
+  const boundaryCirclesLayerRef = useRef<Map<string, L.Circle>>(new Map());
+  // Track which circles each elephant is currently inside (to detect entries)
+  const elephantInsideCirclesRef = useRef<Map<string, Set<string>>>(new Map());
   const lastModeRef = useRef('');
   const hasFitBoundsRef = useRef(false);
   const lastFitNowVersionRef = useRef<number | undefined>(undefined);
@@ -272,6 +283,11 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
         mapRef.current.removeLayer(boundaryCircleRef.current);
         boundaryCircleRef.current = null;
       }
+      // Clear any multi-circles
+      if (boundaryCirclesLayerRef.current.size > 0) {
+        boundaryCirclesLayerRef.current.forEach(c => mapRef.current?.removeLayer(c));
+        boundaryCirclesLayerRef.current.clear();
+      }
       
       markersRef.current = [];
       trailsRef.current = [];
@@ -321,18 +337,34 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
 
         // 1. Reference point marker omitted intentionally to avoid any visual linkage with trails
 
-        // 1.1. Add green boundary circle with unified radius
-        boundaryCircleRef.current = L.circle([referencePoint.lat, referencePoint.lng], {
-          color: '#22c55e',
-          weight: 3,
-          opacity: 0.8,
-          fillColor: '#22c55e',
-          fillOpacity: 0.1,
-          radius: boundaryRadiusMeters // meters
-        }).addTo(mapRef.current);
-        
-        boundaryCircleRef.current.bindPopup(`🟢 Tracking Boundary (${boundaryRadiusMeters}m radius)`);
-        console.log(`🟢 Boundary circle added to map: ${boundaryRadiusMeters}m radius`);
+        // 1.1. Add green boundary circle(s)
+          if (boundaryCircles && boundaryCircles.length > 0) {
+            boundaryCircles.forEach((bc) => {
+              const circle = L.circle([bc.center.lat, bc.center.lng], {
+                color: '#22c55e',
+                weight: 3,
+                opacity: 0.8,
+                fillColor: '#22c55e',
+                fillOpacity: 0.1,
+                radius: bc.radius
+              }).addTo(mapRef.current!);
+              circle.bindPopup(`🟢 Boundary ${bc.id} (${bc.radius}m)`);
+              boundaryCirclesLayerRef.current.set(bc.id, circle);
+            });
+            console.log(`🟢 Boundary circles added: ${boundaryCircles.length}`);
+          } else {
+            const centerLatLng = boundaryCenterLatLng || referencePoint;
+            boundaryCircleRef.current = L.circle([centerLatLng.lat, centerLatLng.lng], {
+              color: '#22c55e',
+              weight: 3,
+              opacity: 0.8,
+              fillColor: '#22c55e',
+              fillOpacity: 0.1,
+              radius: boundaryRadiusMeters // meters
+            }).addTo(mapRef.current);
+            boundaryCircleRef.current.bindPopup(`🟢 Tracking Boundary (${boundaryRadiusMeters}m radius)`);
+            console.log(`🟢 Boundary circle added to map: ${boundaryRadiusMeters}m radius`);
+          }
 
         // 2. Process objects to build elephant trails
         const elephantGroups = new Map<string, FrameObject[]>();
@@ -417,32 +449,44 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
           const currentObj = elephantObjects[elephantObjects.length - 1];
           const currentCoords = localToLatLng(currentObj.x, currentObj.y);
           const currentPoint = [currentCoords.lat, currentCoords.lng] as [number, number];
-          
-          // Check boundary violation (radius from reference point)
-          if (onBoundaryViolation) {
-            // In static mode, App has already transformed coordinates to meters offset from center.
-            // In realtime (frameBasedData), we've already converted objects to meter offsets above.
-            let transformedX: number;
-            let transformedY: number;
-            if (trackingData && !frameBasedData) {
-              transformedX = currentObj.x; // already meters from center
-              transformedY = currentObj.y; // already meters from center
-            } else {
-              // Realtime: use the already-converted meter offsets
-              transformedX = currentObj.x;
-              transformedY = currentObj.y;
+
+          // Compute boundary status relative to multiple circles (or single fallback)
+          let isOutsideCombined = true;
+          let currentInsideSet = new Set<string>();
+          if (boundaryCircles && boundaryCircles.length > 0) {
+            for (const bc of boundaryCircles) {
+              const dLatM = (currentCoords.lat - bc.center.lat) * 111320;
+              const dLngM = (currentCoords.lng - bc.center.lng) * 111320 * Math.cos(bc.center.lat * Math.PI / 180);
+              const dist = Math.sqrt(dLatM * dLatM + dLngM * dLngM);
+              if (dist <= bc.radius) {
+                isOutsideCombined = false;
+                currentInsideSet.add(bc.id);
+              }
             }
-            
-            const distanceFromCenter = Math.sqrt(
-              Math.pow(transformedX, 2) + Math.pow(transformedY, 2)
-            );
-            
-            const isOutsideBoundary = distanceFromCenter > boundaryRadiusMeters; // unified radius
-            
+          } else {
+            const c = boundaryCenterLatLng || referencePoint;
+            const dLatM = (currentCoords.lat - c.lat) * 111320;
+            const dLngM = (currentCoords.lng - c.lng) * 111320 * Math.cos(c.lat * Math.PI / 180);
+            const dist = Math.sqrt(dLatM * dLatM + dLngM * dLngM);
+            isOutsideCombined = dist > boundaryRadiusMeters;
+          }
+          
+          // Check boundary violation and notify
+          if (onBoundaryViolation) {
             // Debug logging
-            console.log(`🐘 ${elephantId}: pos(${currentObj.x}, ${currentObj.y}) -> transformed(${transformedX.toFixed(1)}, ${transformedY.toFixed(1)}) -> distance: ${distanceFromCenter.toFixed(1)}m, outside: ${isOutsideBoundary}, radius=${boundaryRadiusMeters}m`);
-            
-            onBoundaryViolation(elephantId, isOutsideBoundary, { x: currentObj.x, y: currentObj.y });
+            console.log(`🐘 ${elephantId}: latlng(${currentCoords.lat.toFixed(6)}, ${currentCoords.lng.toFixed(6)}) -> outside: ${isOutsideCombined}`);
+            onBoundaryViolation(elephantId, isOutsideCombined, { x: currentObj.x, y: currentObj.y });
+
+            // Detect and notify circle entries (only in multi-circle mode)
+            if (boundaryCircles && boundaryCircles.length > 0) {
+              const prevInside = elephantInsideCirclesRef.current.get(elephantId) || new Set<string>();
+              const newlyEntered: string[] = [];
+              currentInsideSet.forEach((cid) => { if (!prevInside.has(cid)) newlyEntered.push(cid); });
+              elephantInsideCirclesRef.current.set(elephantId, currentInsideSet);
+              if (newlyEntered.length > 0 && typeof onCircleEntry === 'function') {
+                newlyEntered.forEach(cid => onCircleEntry(elephantId, cid));
+              }
+            }
           }
           
           // Update position for E1 and E2 tracking
@@ -491,13 +535,7 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
           }
 
           // Create/update marker for this elephant using computed boundary status
-          const elephantIsOutside = (() => {
-            // Use meter offsets directly in both static and realtime
-            const tx = currentObj.x;
-            const ty = currentObj.y;
-            const d = Math.sqrt(tx * tx + ty * ty);
-            return d > boundaryRadiusMeters;
-          })();
+          const elephantIsOutside = isOutsideCombined;
 
           const elephantColor = elephantIsOutside ? '🔴' : '🐘';
           const markerColor = elephantIsOutside ? '#ff0000' : trailColor;
@@ -510,8 +548,8 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
           });
 
           const popupText = elephantIsOutside 
-            ? `🚨 ALERT: Elephant ${elephantId} OUTSIDE (>${boundaryRadiusMeters}m) - Objects: ${visibleObjectCount}/${currentData.objects.length} (Trail: ${finalTrail.length} pts)`
-            : `🐘 Elephant ${elephantId} (≤${boundaryRadiusMeters}m) - Objects: ${visibleObjectCount}/${currentData.objects.length} (Trail: ${finalTrail.length} pts)`;
+            ? `🚨 ALERT: Elephant ${elephantId} OUTSIDE boundary - Objects: ${visibleObjectCount}/${currentData.objects.length} (Trail: ${finalTrail.length} pts)`
+            : `🐘 Elephant ${elephantId} INSIDE boundary - Objects: ${visibleObjectCount}/${currentData.objects.length} (Trail: ${finalTrail.length} pts)`;
 
           // Remove existing marker for this elephant
           if (elephantMarkersRef.current.has(elephantId) && mapRef.current) {

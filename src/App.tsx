@@ -24,6 +24,10 @@ function App() {
   const [fitNowVersion, setFitNowVersion] = useState(0)
   // Boundary radius (meters)
   const [boundaryRadius, setBoundaryRadius] = useState<number>(500)
+  const [boundaryCenter, setBoundaryCenter] = useState<{ lat: number, lng: number } | null>(null)
+  const [boundaryPickMode, setBoundaryPickMode] = useState<boolean>(false)
+  const [boundaryCircles, setBoundaryCircles] = useState<Array<{ id: string, name?: string, center: { lat: number, lng: number }, radius: number }>>([])
+  const [boundaryAddCircleMode, setBoundaryAddCircleMode] = useState<boolean>(false)
   // Realtime mode
   const [isRealtime, setIsRealtime] = useState<boolean>(false)
   const [realtimeActive, setRealtimeActive] = useState<boolean>(false) // starts when Play is clicked
@@ -164,9 +168,22 @@ function App() {
     }
   }
 
-  const handleLocationClick = (lng: number, lat: number) => {
+  const handleLocationClick = (lat: number, lng: number) => {
+    if (boundaryPickMode) {
+      setBoundaryCenter({ lat, lng })
+      setBoundaryPickMode(false)
+      setMessage(`Boundary center set to (${lat.toFixed(5)}, ${lng.toFixed(5)})`)
+      return
+    }
+    if (boundaryAddCircleMode) {
+      const id = `C${Date.now()}`
+      const nextIndex = boundaryCircles.length + 1
+      setBoundaryCircles(prev => [...prev, { id, name: `Circle ${nextIndex}`, center: { lat, lng }, radius: boundaryRadius }])
+      setBoundaryAddCircleMode(false)
+      setMessage(`Added circle ${id} at (${lat.toFixed(5)}, ${lng.toFixed(5)}) with radius ${boundaryRadius}m`)
+      return
+    }
     console.log(`Location clicked: ${lat}, ${lng}`)
-    // We can add video functionality later if needed
   }
 
   const handleTrailToggle = (checked: boolean) => {
@@ -323,9 +340,18 @@ function App() {
         isRealTime={isRealtime}
         onPositionUpdate={handlePositionUpdate}
         onBoundaryViolation={handleBoundaryViolation}
+        onCircleEntry={(elephantId, circleId) => {
+          const circle = boundaryCircles.find(c => c.id === circleId)
+          const label = circle?.name || circleId
+          const msg = `✅ ${elephantId} has entered circle ${label}`
+          setBoundaryAlerts(prev => [...prev.slice(-4), msg])
+          setMessage(msg)
+        }}
         autoFitEnabled={autoFitEnabled}
         fitNowVersion={fitNowVersion}
         boundaryRadiusMeters={boundaryRadius}
+        boundaryCenterLatLng={boundaryCenter || DEFAULT_REFERENCE_POINT}
+        boundaryCircles={boundaryCircles}
       />
       
 
@@ -522,6 +548,101 @@ function App() {
                   style={{ width: '90px', padding: '4px 6px', fontSize: '12px' }}
                 />
               </div>
+
+              {/* Boundary Center Controls */}
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '10px' }}>
+                <label style={{ fontSize: '12px', color: '#374151' }}>
+                  Boundary center:
+                </label>
+                <button
+                  onClick={() => setBoundaryPickMode(true)}
+                  disabled={boundaryPickMode}
+                  title="Click this, then click on the map to set boundary center"
+                  style={{ padding: '4px 8px', backgroundColor: boundaryPickMode ? '#ccc' : '#2563eb', color: 'white', border: 'none', borderRadius: '4px', cursor: boundaryPickMode ? 'not-allowed' : 'pointer', fontSize: '12px' }}
+                >
+                  {boundaryPickMode ? 'Click on map…' : 'Pick on map'}
+                </button>
+                <button
+                  onClick={() => setBoundaryCenter(null)}
+                  title="Reset boundary center to reference point"
+                  style={{ padding: '4px 8px', backgroundColor: '#6b7280', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', fontSize: '12px' }}
+                >
+                  Reset
+                </button>
+              </div>
+              <div style={{ fontSize: '11px', color: '#64748b', marginTop: '-6px', marginBottom: '10px' }}>
+                Center: {(boundaryCenter || DEFAULT_REFERENCE_POINT).lat.toFixed(5)}, {(boundaryCenter || DEFAULT_REFERENCE_POINT).lng.toFixed(5)}
+              </div>
+
+              {/* Multi-circle controls */}
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '10px' }}>
+                <label style={{ fontSize: '12px', color: '#374151' }}>Multiple circles:</label>
+                <button
+                  onClick={() => setBoundaryAddCircleMode(true)}
+                  disabled={boundaryAddCircleMode}
+                  title="Click this, then click on the map to add a boundary circle at that point"
+                  style={{ padding: '4px 8px', backgroundColor: boundaryAddCircleMode ? '#ccc' : '#10b981', color: 'white', border: 'none', borderRadius: '4px', cursor: boundaryAddCircleMode ? 'not-allowed' : 'pointer', fontSize: '12px' }}
+                >
+                  {boundaryAddCircleMode ? 'Click on map…' : 'Add circle on map'}
+                </button>
+                <button
+                  onClick={() => setBoundaryCircles([])}
+                  disabled={boundaryCircles.length === 0}
+                  title="Remove all circles"
+                  style={{ padding: '4px 8px', backgroundColor: boundaryCircles.length === 0 ? '#ccc' : '#ef4444', color: 'white', border: 'none', borderRadius: '4px', cursor: boundaryCircles.length === 0 ? 'not-allowed' : 'pointer', fontSize: '12px' }}
+                >
+                  Clear all
+                </button>
+              </div>
+              {boundaryCircles.length > 0 && (
+                <div style={{ marginBottom: '10px', border: '1px solid #e5e7eb', borderRadius: '8px', padding: '8px', background: '#f9fafb' }}>
+                  <div style={{ fontSize: '12px', color: '#374151', marginBottom: '6px', fontWeight: 600 }}>
+                    Circles ({boundaryCircles.length})
+                  </div>
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '180px', overflowY: 'auto' }}>
+                    {boundaryCircles.map((c, idx) => (
+                      <div key={c.id} style={{ display: 'grid', gridTemplateColumns: '1.1fr 1.3fr 1fr auto', gap: '6px', alignItems: 'center' }}>
+                        <div style={{ display: 'flex', gap: '6px', alignItems: 'center' }}>
+                          <input
+                            type="text"
+                            value={c.name || ''}
+                            placeholder={`Circle ${idx + 1}`}
+                            onChange={(e) => {
+                              const val = e.target.value
+                              setBoundaryCircles(prev => prev.map(x => x.id === c.id ? { ...x, name: val } : x))
+                            }}
+                            title="Circle name"
+                            style={{ width: '100%', padding: '4px 6px', fontSize: '12px' }}
+                          />
+                        </div>
+                        <div style={{ fontSize: '11px', color: '#6b7280' }}>({c.center.lat.toFixed(5)}, {c.center.lng.toFixed(5)})</div>
+                        <div>
+                          <input
+                            type="number"
+                            min={50}
+                            max={10000}
+                            step={50}
+                            value={c.radius}
+                            onChange={(e) => {
+                              const val = Number(e.target.value) || 0
+                              setBoundaryCircles(prev => prev.map(x => x.id === c.id ? { ...x, radius: val } : x))
+                            }}
+                            title="Radius (m)"
+                            style={{ width: '100%', padding: '4px 6px', fontSize: '12px' }}
+                          />
+                        </div>
+                        <button
+                          onClick={() => setBoundaryCircles(prev => prev.filter(x => x.id !== c.id))}
+                          title="Remove this circle"
+                          style={{ padding: '4px 8px', backgroundColor: '#ef4444', color: 'white', border: 'none', borderRadius: '4px', cursor: 'pointer', fontSize: '12px' }}
+                        >
+                          Remove
+                        </button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
 
               {/* Trail Toggle */}
               <label style={{ display: 'flex', alignItems: 'center', fontSize: '14px', color: '#2563eb' }}>
