@@ -88,6 +88,7 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
   // Per-elephant start markers (static once created)
   const elephantStartMarkersRef = useRef<Map<string, L.Marker>>(new Map());
   const boundaryRef = useRef<L.Polygon | null>(null);
+  const boundaryCircleRef = useRef<L.Circle | null>(null);
   const lastModeRef = useRef('');
 
   // Initialize map
@@ -192,6 +193,10 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
         mapRef.current.removeLayer(boundaryRef.current);
         boundaryRef.current = null;
       }
+      if (boundaryCircleRef.current) {
+        mapRef.current.removeLayer(boundaryCircleRef.current);
+        boundaryCircleRef.current = null;
+      }
       
       markersRef.current = [];
       trailsRef.current = [];
@@ -239,6 +244,19 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
           .addTo(mapRef.current)
           .bindPopup('📍 Reference Point');
         markersRef.current.push(refMarker);
+
+        // 1.1. Add green boundary circle (500m radius)
+        boundaryCircleRef.current = L.circle([referencePoint.lat, referencePoint.lng+0.031], {
+          color: '#22c55e',
+          weight: 3,
+          opacity: 0.8,
+          fillColor: '#22c55e',
+          fillOpacity: 0.1,
+          radius: 5000 // 500 meters radius
+        }).addTo(mapRef.current);
+        
+        boundaryCircleRef.current.bindPopup('🟢 Tracking Boundary (500m radius)');
+        console.log('🟢 Boundary circle added to map: 500m radius');
 
         // 2. Process objects to build elephant trails
         const elephantGroups = new Map<string, FrameObject[]>();
