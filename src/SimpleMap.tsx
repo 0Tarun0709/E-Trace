@@ -186,31 +186,52 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
     let referencePoint: { lat: number; lng: number };
     let scale: { metersPerUnit: number };
     
-    if (frameBasedData?.frames) {
+  if (frameBasedData?.frames) {
       // Real-time frame-based data
       frames = frameBasedData.frames;
       const cameraConfig = frameBasedData.metadata?.camera_config || frames[0];
       referencePoint = cameraConfig.referencePoint;
-      scale = cameraConfig.scale;
+      // We'll convert pixels to meters explicitly below and then use scale=1 in localToLatLng
+      // to avoid double scaling.
+      scale = { metersPerUnit: 1 };
       
   // Convert frame-based to object-based for animation
   const allObjects: FrameObject[] = [];
-  // Always limit by currentPointIndex to ensure pause doesn't jump to end
-  const maxFrames = Math.min(currentPointIndex + 1, frames.length);
-      
-      for (let i = 0; i < maxFrames; i++) {
+  // In realtime mode process only the latest frame; in playback, limit by current index
+      if (isRealTime) {
+        const i = Math.max(0, frames.length - 1);
         const frame = frames[i];
-        frame.objects.forEach((obj: FrameObject) => {
-          allObjects.push({
-            ...obj,
-            frameIndex: i // Add frame index for proper ordering
-          });
+        // Dedupe per elephant ID within the same frame; keep the highest confidence or last seen
+        const perId = new Map<string, FrameObject & { confidence?: number }>();
+        frame.objects.forEach((obj: FrameObject & { confidence?: number }) => {
+          const id = String(obj.id);
+          const existing = perId.get(id);
+          if (!existing || ((obj.confidence || 0) >= (existing.confidence || 0))) {
+            perId.set(id, obj);
+          }
         });
+        perId.forEach((obj) => {
+          const mPerUnit = (cameraConfig.scale && typeof cameraConfig.scale.metersPerUnit === 'number') ? cameraConfig.scale.metersPerUnit : 1;
+          const xMeters = (obj.x - 800) * mPerUnit;
+          const yMeters = (obj.y - 500) * mPerUnit;
+          allObjects.push({ ...obj, x: xMeters, y: yMeters, frameIndex: i });
+        });
+      } else {
+        const maxFrames = Math.min(currentPointIndex + 1, frames.length);
+        for (let i = 0; i < maxFrames; i++) {
+          const frame = frames[i];
+          frame.objects.forEach((obj: FrameObject) => {
+            const mPerUnit = (cameraConfig.scale && typeof cameraConfig.scale.metersPerUnit === 'number') ? cameraConfig.scale.metersPerUnit : 1;
+            const xMeters = (obj.x - 800) * mPerUnit;
+            const yMeters = (obj.y - 500) * mPerUnit;
+            allObjects.push({ ...obj, x: xMeters, y: yMeters, frameIndex: i });
+          });
+        }
       }
       
       currentData = {
         referencePoint,
-        scale: { metersPerUnit: 1 }, // 1 unit = 1 meter
+        scale: { metersPerUnit: 1 }, // already converted to meters above
         objects: allObjects
       };
     } else if (trackingData) {
@@ -287,17 +308,18 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
       // Removed distance calculation - no longer needed for trail logic
 
       if (currentData.objects.length > 0) {
-  // Determine how many objects to show based on animation (independent of play/pause)
-  const visibleObjectCount = Math.min(currentPointIndex + 1, currentData.objects.length);
-        const visibleObjects = currentData.objects.slice(0, visibleObjectCount);
+        // Thresholds for filtering near the reference point
+        const centerSkipMeters = 1; // 1 meter
+        const centerSkipLat = centerSkipMeters / 111320;
+        const centerSkipLng = centerSkipMeters / (111320 * Math.cos(referencePoint.lat * Math.PI / 180));
+        // Determine how many objects to show
+        const useAll = isRealTime && !!frameBasedData;
+        const visibleObjectCount = useAll ? currentData.objects.length : Math.min(currentPointIndex + 1, currentData.objects.length);
+        const visibleObjects = useAll ? currentData.objects : currentData.objects.slice(0, visibleObjectCount);
         
         console.log(`📍 Processing objects: ${visibleObjectCount}/${currentData.objects.length}`);
 
-        // 1. Add reference point
-        const refMarker = L.marker([referencePoint.lat, referencePoint.lng])
-          .addTo(mapRef.current)
-          .bindPopup('📍 Reference Point');
-        markersRef.current.push(refMarker);
+        // 1. Reference point marker omitted intentionally to avoid any visual linkage with trails
 
         // 1.1. Add green boundary circle with unified radius
         boundaryCircleRef.current = L.circle([referencePoint.lat, referencePoint.lng], {
@@ -336,10 +358,18 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
           });
           
           // Build trail coordinates for this elephant in chronological order
-          const elephantCoords = sortedObjects.map(obj => {
+          // Skip near-center points to avoid segments connecting to the reference point
+          const centerSkipMeters = 1; // drop points within 1 meter of center
+          const elephantCoords: [number, number][] = [];
+          for (const obj of sortedObjects) {
+            const distFromCenterM = Math.hypot(obj.x, obj.y); // obj.x/obj.y are meter offsets in realtime
+            if (distFromCenterM < centerSkipMeters) {
+              // Skip near-center detections to prevent drawing lines to the reference point
+              continue;
+            }
             const coords = localToLatLng(obj.x, obj.y);
-            return [coords.lat, coords.lng] as [number, number];
-          });
+            elephantCoords.push([coords.lat, coords.lng]);
+          }
           
           // For static data mode, rebuild trail completely from sorted data
           // For real-time mode, accumulate points
@@ -351,15 +381,21 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
           } else {
             // Real-time mode: accumulate trail points
             let existingTrail = elephantPathsRef.current.get(elephantId) || [];
-            let updatedTrail = [...existingTrail];
+            // Remove any existing trail points too close to the reference point (distance-based)
+            const refLat = referencePoint.lat;
+            const refLng = referencePoint.lng;
+            const centerSkipLat = centerSkipMeters / 111320;
+            const centerSkipLng = centerSkipMeters / (111320 * Math.cos(refLat * Math.PI / 180));
+            let updatedTrail = existingTrail.filter(([lat, lng]) => !(Math.abs(lat - refLat) < centerSkipLat && Math.abs(lng - refLng) < centerSkipLng));
             
             for (const newPoint of elephantCoords) {
               const lastPoint = updatedTrail[updatedTrail.length - 1];
               const isDuplicate = lastPoint && 
                 Math.abs(lastPoint[0] - newPoint[0]) < 0.00001 && 
                 Math.abs(lastPoint[1] - newPoint[1]) < 0.00001;
+              const isRefPoint = Math.abs(newPoint[0] - refLat) < centerSkipLat && Math.abs(newPoint[1] - refLng) < centerSkipLng;
               
-              if (!isDuplicate) {
+              if (!isDuplicate && !isRefPoint) {
                 updatedTrail.push(newPoint);
               }
             }
@@ -377,8 +413,6 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
           
           console.log(`🐘 Trail built for ${elephantId}: ${finalTrail.length} points (static: ${!frameBasedData && !!trackingData})`);
           
-          if (finalTrail.length === 0) return;
-          
           // Get current position (last point)
           const currentObj = elephantObjects[elephantObjects.length - 1];
           const currentCoords = localToLatLng(currentObj.x, currentObj.y);
@@ -387,16 +421,16 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
           // Check boundary violation (radius from reference point)
           if (onBoundaryViolation) {
             // In static mode, App has already transformed coordinates to meters offset from center.
-            // In realtime (frameBasedData), fall back to translating around (800,500) using scale (meters per unit).
+            // In realtime (frameBasedData), we've already converted objects to meter offsets above.
             let transformedX: number;
             let transformedY: number;
             if (trackingData && !frameBasedData) {
               transformedX = currentObj.x; // already meters from center
               transformedY = currentObj.y; // already meters from center
             } else {
-              const mPerUnit = (scale && typeof scale.metersPerUnit === 'number') ? scale.metersPerUnit : 1;
-              transformedX = (currentObj.x - 800) * mPerUnit;
-              transformedY = (currentObj.y - 500) * mPerUnit;
+              // Realtime: use the already-converted meter offsets
+              transformedX = currentObj.x;
+              transformedY = currentObj.y;
             }
             
             const distanceFromCenter = Math.sqrt(
@@ -420,39 +454,47 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
           if (elephantTrailsRef.current.has(elephantId) && mapRef.current) {
             mapRef.current.removeLayer(elephantTrailsRef.current.get(elephantId)!);
           }
-          
-          // Create new trail for this elephant with unique color
+
+          // Create new trail for this elephant with unique color (only if >= 2 points)
           const trailColors = ['#ff0000', '#0066ff', '#00ff00', '#ff6600', '#9900ff'];
           // Use hash of elephant ID for consistent color assignment
           const colorIndex = elephantId.split('').reduce((acc, char) => acc + char.charCodeAt(0), 0) % trailColors.length;
           const trailColor = trailColors[colorIndex];
           
           if (!mapRef.current) return;
-          
-          const elephantPolyline = L.polyline(finalTrail, {
-            color: trailColor,
-            weight: 4,
-            opacity: 0.8,
-            lineCap: 'round',
-            lineJoin: 'round'
-          }).addTo(mapRef.current);
-          
-          elephantPolyline.bindPopup(`🐘 Elephant ${elephantId} Trail (${finalTrail.length} points)`);
-          elephantTrailsRef.current.set(elephantId, elephantPolyline);
+          // Clean trail: remove any points close to the reference point and collapse duplicates
+          const refLat = referencePoint.lat;
+          const refLng = referencePoint.lng;
+          // reuse centerSkipLat/centerSkipLng thresholds computed earlier where we filtered objects
+          const cleanedTrail: [number, number][] = [];
+          for (const [lat, lng] of finalTrail) {
+            const isNearCenter = Math.abs(lat - refLat) < centerSkipLat && Math.abs(lng - refLng) < centerSkipLng;
+            if (isNearCenter) continue;
+            const last = cleanedTrail[cleanedTrail.length - 1];
+            const isDup = last && Math.abs(last[0] - lat) < 1e-7 && Math.abs(last[1] - lng) < 1e-7;
+            if (!isDup) cleanedTrail.push([lat, lng]);
+          }
+
+          if (cleanedTrail.length >= 2) {
+            const elephantPolyline = L.polyline(cleanedTrail, {
+              color: trailColor,
+              weight: 4,
+              opacity: 0.8,
+              lineCap: 'round',
+              lineJoin: 'round'
+            }).addTo(mapRef.current);
+            elephantPolyline.bindPopup(`🐘 Elephant ${elephantId} Trail (${cleanedTrail.length} points)`);
+            elephantTrailsRef.current.set(elephantId, elephantPolyline);
+          } else {
+            // No trail to draw yet
+            elephantTrailsRef.current.delete(elephantId);
+          }
 
           // Create/update marker for this elephant using computed boundary status
           const elephantIsOutside = (() => {
-            // Recompute minimal distance using same logic as above to color marker
-            let tx: number;
-            let ty: number;
-            if (trackingData && !frameBasedData) {
-              tx = currentObj.x;
-              ty = currentObj.y;
-            } else {
-              const mPerUnit = (scale && typeof scale.metersPerUnit === 'number') ? scale.metersPerUnit : 1;
-              tx = (currentObj.x - 800) * mPerUnit;
-              ty = (currentObj.y - 500) * mPerUnit;
-            }
+            // Use meter offsets directly in both static and realtime
+            const tx = currentObj.x;
+            const ty = currentObj.y;
             const d = Math.sqrt(tx * tx + ty * ty);
             return d > boundaryRadiusMeters;
           })();
@@ -485,9 +527,9 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
           
           elephantMarkersRef.current.set(elephantId, elephantMarker);
 
-          // Create a static start marker for this elephant (only once)
-          if (!elephantStartMarkersRef.current.has(elephantId) && finalTrail.length > 0) {
-            const startPoint = finalTrail[0];
+          // Create a static start marker for this elephant (only once and when trail has at least one point)
+          if (!elephantStartMarkersRef.current.has(elephantId) && cleanedTrail.length > 0) {
+            const startPoint = cleanedTrail[0];
             const startMarker = L.marker(startPoint)
               .addTo(mapRef.current)
               .bindPopup(`📍 ${elephantId} Start`);
@@ -500,7 +542,8 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
         // 6. Fit bounds based on controls
         const shouldManualFit = typeof fitNowVersion === 'number' && fitNowVersion !== lastFitNowVersionRef.current;
         const shouldAutoFit = autoFitEnabled;
-        if (!hasFitBoundsRef.current || shouldAutoFit || shouldManualFit) {
+        const allowOnceFit = !isRealTime && !hasFitBoundsRef.current;
+        if (allowOnceFit || shouldAutoFit || shouldManualFit) {
           const boundCoords: [number, number][] = [];
           elephantPathsRef.current.forEach((path) => {
             boundCoords.push(...path);
@@ -528,7 +571,7 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
         mapRef.current && mapRef.current.invalidateSize();
       }, 0);
     }
-  }, [trackingData, frameBasedData, isAnimating, currentPointIndex, boundaryData, elephantsInBoundary]);
+  }, [trackingData, frameBasedData, isAnimating, currentPointIndex, boundaryData, elephantsInBoundary, boundaryRadiusMeters, isRealTime]);
 
   return (
     <>
@@ -596,11 +639,11 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
                 </div>
               )}
               <div style={{ fontSize: '11px', color: '#64748b', marginTop: '8px' }}>
-                <div>📍 Blue Pin: Reference Point</div>
+                <div>� Green Circle: Boundary Radius</div>
                 <div>🎨 Colored Trails: Per-Elephant Paths</div>
-                <div>� Start Markers: Initial Positions</div>
+                <div>🏁 Start Markers: Initial Positions</div>
                 <div>🐘 Current: Live Elephant Positions</div>
-                <div>� Red Alert: Boundary Violations</div>
+                <div>🔴 Red Alert: Boundary Violations</div>
               </div>
             </div>
           )}

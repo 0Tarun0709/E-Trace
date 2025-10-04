@@ -1,0 +1,1 @@
+{"referencePoint": {"lat": -1.2921, "lng": 34.7617}, "scale": {"metersPerUnit": 10}, "objects": [{"id": 2, "x": 1217, "y": 368, "timestamp": 1759607705371, "objectType": "elephant", "confidence": 0.78}, {"id": 1, "x": 172, "y": 512, "timestamp": 1759607705371, "objectType": "elephant", "confidence": 0.61}], "frame_number": 244, "timestamp": 1759607705371, "video_fps": 30.0}

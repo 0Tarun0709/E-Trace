@@ -16,6 +16,8 @@ from inference import get_model
 import supervision as sv
 from datetime import datetime
 import logging
+import argparse
+import os
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -38,7 +40,7 @@ class RealTimeElephantTracker:
         
         # Video configuration  
         # Update this path to your actual video file
-        self.input_video_path = r"/Users/tarun/Desktop/Sic/HWC-Hackathon/assets/ScreenRec-4.mov"  # Update this path!
+        self.input_video_path = r"/Users/tarun/Downloads/Wild Elephants captured on trail camera.mp4"  # Update this path!
         
         # Initialize model and tracker
         self.model = get_model(model_id="elephant-detection-cxnt1/4", api_key=self.ROBOFLOW_API_KEY)
@@ -60,6 +62,7 @@ class RealTimeElephantTracker:
         self.frame_count = 0
         self.start_time = None
         self.is_running = False
+        self.headless = False
         
         logger.info("Real-time Elephant Tracker initialized")
 
@@ -107,10 +110,33 @@ class RealTimeElephantTracker:
 
     def initialize_video_capture(self):
         """Initialize video capture"""
+        # Try to release any previous capture
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+
         self.cap = cv2.VideoCapture(self.input_video_path)
         
         if not self.cap.isOpened():
             logger.error(f"Error opening video: {self.input_video_path}")
+            # Write an error status file so frontend knows why it's not live
+            try:
+                latest_path = "/Users/tarun/Desktop/Sic/HWC-one-Nighter/public/latest_detections.json"
+                with open(latest_path, 'w') as f:
+                    json.dump({
+                        "referencePoint": self.CAMERA_CONFIG["referencePoint"],
+                        "scale": self.CAMERA_CONFIG["scale"],
+                        "objects": [],
+                        "frame_number": 0,
+                        "timestamp": int(time.time() * 1000),
+                        "status": {
+                            "error": f"Cannot open video: {self.input_video_path}"
+                        }
+                    }, f)
+            except Exception as e:
+                logger.warning(f"Failed to write error latest_detections.json: {e}")
             return False
             
         self.fps = self.cap.get(cv2.CAP_PROP_FPS)
@@ -183,6 +209,14 @@ class RealTimeElephantTracker:
         
         # Store tracking data
         self.all_tracking_data.append(frame_data)
+
+        # Also write latest detections JSON for the web app to poll
+        try:
+            latest_path = "/Users/tarun/Desktop/Sic/HWC-one-Nighter/public/latest_detections.json"
+            with open(latest_path, 'w') as f:
+                json.dump(frame_data, f)
+        except Exception as e:
+            logger.warning(f"Failed to write latest_detections.json: {e}")
         
         # Create annotated frame for display (optional)
         annotated_frame = self.bounding_box_annotator.annotate(scene=frame.copy(), detections=detections)
@@ -204,9 +238,10 @@ class RealTimeElephantTracker:
                                (current_pos[0] + 15, current_pos[1] - 15), 
                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
         
-        # Show frame (optional, comment out for headless operation)
-        cv2.imshow('Live Elephant Tracking', annotated_frame)
-        cv2.waitKey(1)
+        # Show frame (optional, skip in headless mode)
+        if not self.headless:
+            cv2.imshow('Live Elephant Tracking', annotated_frame)
+            cv2.waitKey(1)
         
         return frame_data
 
@@ -229,7 +264,21 @@ class RealTimeElephantTracker:
             }
         })
         
-        frame_interval = 1.0 / 2.0  # Process 2 frames per second for real-time feel
+        # Write a baseline latest JSON so frontend can switch from "connecting"
+        try:
+            latest_path = "/Users/tarun/Desktop/Sic/HWC-one-Nighter/public/latest_detections.json"
+            with open(latest_path, 'w') as f:
+                json.dump({
+                    "referencePoint": self.CAMERA_CONFIG["referencePoint"],
+                    "scale": self.CAMERA_CONFIG["scale"],
+                    "objects": [],
+                    "frame_number": 0,
+                    "timestamp": int(time.time() * 1000)
+                }, f)
+        except Exception as e:
+            logger.warning(f"Failed to write baseline latest_detections.json: {e}")
+
+        frame_interval = 1.0 / 2.0  # Process ~2 frames per second for real-time feel
         
         while self.is_running:
             try:
@@ -278,19 +327,42 @@ class RealTimeElephantTracker:
             command = data.get('command')
             
             if command == 'start_tracking':
+                # Optional video_path in payload
+                video_path = data.get('video_path')
+                if video_path:
+                    self.input_video_path = video_path
+                    logger.info(f"Video path set via WS: {self.input_video_path}")
                 if not self.is_running:
                     # Start tracking in background task
                     asyncio.create_task(self.start_real_time_tracking())
-                await self.send_to_client(websocket, {
-                    "type": "command_response",
-                    "data": {"status": "tracking_started" if not self.is_running else "already_running"}
-                })
+                    await self.send_to_client(websocket, {
+                        "type": "command_response",
+                        "data": {"status": "tracking_started", "video": self.input_video_path}
+                    })
+                else:
+                    await self.send_to_client(websocket, {
+                        "type": "command_response",
+                        "data": {"status": "already_running", "video": self.input_video_path}
+                    })
                 
             elif command == 'stop_tracking':
                 self.is_running = False
                 await self.send_to_client(websocket, {
                     "type": "command_response", 
                     "data": {"status": "tracking_stopped"}
+                })
+            elif command == 'set_config':
+                # Allow updating referencePoint and/or scale at runtime
+                cfg = data.get('config', {})
+                rp = cfg.get('referencePoint')
+                sc = cfg.get('scale')
+                if isinstance(rp, dict) and 'lat' in rp and 'lng' in rp:
+                    self.CAMERA_CONFIG['referencePoint'] = { 'lat': float(rp['lat']), 'lng': float(rp['lng']) }
+                if isinstance(sc, dict) and 'metersPerUnit' in sc:
+                    self.CAMERA_CONFIG['scale'] = { 'metersPerUnit': float(sc['metersPerUnit']) }
+                await self.send_to_client(websocket, {
+                    "type": "command_response",
+                    "data": {"status": "config_updated", "config": self.CAMERA_CONFIG}
                 })
                 
             elif command == 'get_status':
@@ -327,16 +399,33 @@ async def handle_client(websocket):
 
 async def main():
     """Start the WebSocket server"""
+    parser = argparse.ArgumentParser(description='Real-time Elephant Tracking WebSocket Server')
+    parser.add_argument('--video', type=str, help='Path to the input video file')
+    parser.add_argument('--host', type=str, default='localhost', help='WebSocket host (default: localhost)')
+    parser.add_argument('--port', type=int, default=8765, help='WebSocket port (default: 8765)')
+    parser.add_argument('--autostart', action='store_true', help='Automatically start tracking on launch')
+    parser.add_argument('--headless', action='store_true', help='Disable OpenCV window (no GUI)')
+    args = parser.parse_args()
+
+    if args.video:
+        tracker.input_video_path = args.video
+        logger.info(f"CLI video path set: {tracker.input_video_path}")
+    if args.headless:
+        tracker.headless = True
+        logger.info("Headless mode enabled (no OpenCV window)")
+
     logger.info("Starting Real-time Elephant Tracking WebSocket Server...")
-    logger.info("Server will be available at ws://localhost:8765")
-    
-    # Start WebSocket server - newer websockets library syntax
+    logger.info(f"Server will be available at ws://{args.host}:{args.port}")
     logger.info("🐘 Real-time Elephant Tracking Server running!")
-    logger.info("📡 WebSocket server: ws://localhost:8765")
+    logger.info(f"📡 WebSocket server: ws://{args.host}:{args.port}")
     logger.info("🎥 Ready to process video and send live updates")
     
-    async with websockets.serve(handle_client, "localhost", 8765):
+    async with websockets.serve(handle_client, args.host, args.port):
         logger.info("Server started successfully!")
+        # Autostart tracking if requested or if a video path was provided
+        if args.autostart or args.video:
+            logger.info("Autostarting tracking loop...")
+            asyncio.create_task(tracker.start_real_time_tracking())
         await asyncio.Future()  # Run forever
 
 if __name__ == "__main__":

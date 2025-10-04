@@ -24,6 +24,18 @@ function App() {
   const [fitNowVersion, setFitNowVersion] = useState(0)
   // Boundary radius (meters)
   const [boundaryRadius, setBoundaryRadius] = useState<number>(500)
+  // Realtime mode
+  const [isRealtime, setIsRealtime] = useState<boolean>(false)
+  const [realtimeActive, setRealtimeActive] = useState<boolean>(false) // starts when Play is clicked
+  const [realtimeStatus, setRealtimeStatus] = useState<'idle'|'connecting'|'live'|'error'>('idle')
+  const [realtimeError, setRealtimeError] = useState<string | null>(null)
+  const [lastRealtimeTs, setLastRealtimeTs] = useState<number | null>(null)
+  const [frameBasedData, setFrameBasedData] = useState<any | null>(null)
+
+  // Lock reference point for both static and realtime to avoid map center drift
+  const DEFAULT_REFERENCE_POINT = { lat: -1.2921, lng: 34.7617 }
+  // Realtime scale: tune this down; default 1 meter per unit (pixel)
+  const [realtimeMetersPerUnit, setRealtimeMetersPerUnit] = useState<number>(1)
   
   // Elephant position tracking for E1 and E2
   const [elephantPositions, setElephantPositions] = useState<{
@@ -169,7 +181,16 @@ function App() {
 
   // Animation control functions
   const startAnimation = () => {
-    // If at the end, restart from beginning, otherwise resume from current position
+    if (isRealtime) {
+      // Start realtime polling on Play
+      setRealtimeActive(true)
+      setRealtimeStatus('connecting')
+      setFrameBasedData(null)
+      setIsPlaying(false)
+      setCurrentPointIndex(0)
+      return
+    }
+    // Static playback
     if (currentPointIndex >= totalPoints) {
       setCurrentPointIndex(0)
     }
@@ -177,10 +198,20 @@ function App() {
   }
 
   const pauseAnimation = () => {
+    if (isRealtime) {
+      setRealtimeActive(false)
+      setRealtimeStatus('idle')
+      return
+    }
     setIsPlaying(false)
   }
 
   const resetAnimation = () => {
+    if (isRealtime) {
+      setRealtimeActive(false)
+      setRealtimeStatus('idle')
+      setFrameBasedData(null)
+    }
     setIsPlaying(false)
     setCurrentPointIndex(0)
   }
@@ -205,6 +236,66 @@ function App() {
     return () => clearTimeout(timer)
   }, [isPlaying, currentPointIndex, totalPoints, animationSpeed, trackingData])
 
+  // Realtime polling effect (starts only when realtimeActive is true)
+  useEffect(() => {
+    if (!(isRealtime && realtimeActive)) return
+    let cancelled = false
+    setRealtimeStatus((s) => (s === 'idle' ? 'connecting' : s))
+    const interval = setInterval(async () => {
+      try {
+        const res = await fetch(`/latest_detections.json?t=${Date.now()}`, { cache: 'no-store' })
+        if (!res.ok) return
+        const latest = await res.json()
+        if (cancelled) return
+
+        // Always use the same reference point to keep the map centered.
+        // For realtime, use the UI-controlled scale (ignore backend scale to avoid drift/mismatch).
+        const metersPerUnit = realtimeMetersPerUnit
+        const camera_config = {
+          referencePoint: DEFAULT_REFERENCE_POINT,
+          scale: { metersPerUnit }
+        }
+
+        setFrameBasedData((prev: any) => {
+          const frames = prev?.frames ? [...prev.frames] : []
+          const last = frames[frames.length - 1]
+          const frame_number = latest.frame_number || (last ? last.frame_number + 1 : 1)
+          if (!last || last.frame_number !== frame_number) {
+            frames.push({
+              frame_number,
+              referencePoint: camera_config.referencePoint,
+              scale: camera_config.scale,
+              objects: Array.isArray(latest.objects) ? latest.objects.map((o: any) => ({ ...o })) : []
+            })
+          }
+          const fb = {
+            metadata: {
+              total_frames: frames.length,
+              fps: 0,
+              video_duration: 0,
+              camera_config
+            },
+            frames
+          }
+          return fb
+        })
+        // Handle error status from backend file
+        if (latest && latest.status && latest.status.error) {
+          setRealtimeStatus('error')
+          setRealtimeError(String(latest.status.error))
+        } else {
+          setRealtimeStatus('live')
+          setRealtimeError(null)
+        }
+        setLastRealtimeTs(Date.now())
+      } catch (e) {
+        // ignore transient errors but keep status informative
+        setRealtimeStatus((s) => (s === 'idle' ? 'connecting' : s))
+      }
+    }, 1000)
+    return () => { cancelled = true; clearInterval(interval) }
+  }, [isRealtime, realtimeActive])
+
   if (isLoading) {
     return (
       <div style={{ 
@@ -225,10 +316,11 @@ function App() {
     <div className="App">
       <SimpleMap 
         onLocationClick={handleLocationClick} 
-        trackingData={trackingData || undefined}
+        trackingData={!isRealtime ? (trackingData || undefined) : undefined}
+        frameBasedData={isRealtime ? (frameBasedData || undefined) : undefined}
         currentPointIndex={currentPointIndex}
         isAnimating={isPlaying}
-        isRealTime={false}
+        isRealTime={isRealtime}
         onPositionUpdate={handlePositionUpdate}
         onBoundaryViolation={handleBoundaryViolation}
         autoFitEnabled={autoFitEnabled}
@@ -239,7 +331,7 @@ function App() {
 
       
       {/* Animation Controls */}
-      {trackingData && (
+      {(trackingData || isRealtime) && (
         <div style={{
           position: 'absolute',
           top: '20px',
@@ -275,33 +367,75 @@ function App() {
           </div>
           
           {/* Playback Controls */}
-          {trackingData && (
+          {(trackingData || isRealtime) && (
             <>
+              {/* Realtime Toggle */}
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '10px' }}>
+                <label style={{ display: 'flex', alignItems: 'center', fontSize: '12px', color: '#374151' }}>
+                  <input
+                    type="checkbox"
+                    checked={isRealtime}
+                    onChange={(e) => {
+                      const on = e.target.checked
+                      setIsRealtime(on)
+                      setIsPlaying(false)
+                      setCurrentPointIndex(0)
+                      setRealtimeActive(false)
+                      setRealtimeStatus('idle')
+                      if (!on) setFrameBasedData(null)
+                    }}
+                    style={{ marginRight: '6px' }}
+                  />
+                  Real-time mode (poll latest_detections.json)
+                </label>
+                {isRealtime && (
+                  <span style={{ marginLeft: '8px', fontSize: '12px', color: realtimeStatus === 'live' ? '#10b981' : (realtimeStatus === 'error' ? '#ef4444' : '#f59e0b') }}>
+                    • {realtimeStatus === 'live' ? 'Live' : realtimeStatus === 'connecting' ? 'Connecting…' : realtimeStatus === 'error' ? 'Error' : 'Idle'}
+                    {realtimeStatus === 'live' && lastRealtimeTs ? ` (updated ${Math.max(0, Math.round((Date.now()-lastRealtimeTs)/1000))}s ago)` : ''}
+                    {realtimeStatus === 'error' && realtimeError ? ` (${realtimeError})` : ''}
+                  </span>
+                )}
+              </div>
+              {/* Realtime scale control */}
+              {isRealtime && (
+                <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '10px' }}>
+                  <label style={{ fontSize: '12px', color: '#374151' }}>Realtime scale (m/unit):</label>
+                  <input
+                    type="number"
+                    min={0.1}
+                    max={20}
+                    step={0.1}
+                    value={realtimeMetersPerUnit}
+                    onChange={(e) => setRealtimeMetersPerUnit(Math.max(0.1, Number(e.target.value) || 0.1))}
+                    style={{ width: '90px', padding: '4px 6px', fontSize: '12px' }}
+                  />
+                </div>
+              )}
               <div style={{ display: 'flex', gap: '8px', marginBottom: '10px' }}>
                 <button 
                   onClick={startAnimation}
-                  disabled={isPlaying}
+                  disabled={(!isRealtime && isPlaying) || (isRealtime && realtimeActive)}
                   style={{
                     padding: '6px 12px',
-                    backgroundColor: isPlaying ? '#ccc' : '#10b981',
+                    backgroundColor: ((!isRealtime && isPlaying) || (isRealtime && realtimeActive)) ? '#ccc' : '#10b981',
                     color: 'white',
                     border: 'none',
                     borderRadius: '4px',
-                    cursor: isPlaying ? 'not-allowed' : 'pointer'
+                    cursor: ((!isRealtime && isPlaying) || (isRealtime && realtimeActive)) ? 'not-allowed' : 'pointer'
                   }}
                 >
                   ▶️ Play
                 </button>
                 <button 
                   onClick={pauseAnimation}
-                  disabled={!isPlaying}
+                  disabled={(!isRealtime && !isPlaying) || (isRealtime && !realtimeActive)}
                   style={{
                     padding: '6px 12px',
-                    backgroundColor: !isPlaying ? '#ccc' : '#f59e0b',
+                    backgroundColor: ((!isRealtime && !isPlaying) || (isRealtime && !realtimeActive)) ? '#ccc' : '#f59e0b',
                     color: 'white',
                     border: 'none',
                     borderRadius: '4px',
-                    cursor: !isPlaying ? 'not-allowed' : 'pointer'
+                    cursor: ((!isRealtime && !isPlaying) || (isRealtime && !realtimeActive)) ? 'not-allowed' : 'pointer'
                   }}
                 >
                   ⏸️ Pause
@@ -341,10 +475,12 @@ function App() {
                 </select>
               </div>
 
-              {/* Progress */}
-              <div style={{ fontSize: '12px', color: '#666', marginBottom: '10px' }}>
-                Progress: {currentPointIndex} / {totalPoints} points
-              </div>
+              {/* Progress (disabled in realtime) */}
+              {!isRealtime && (
+                <div style={{ fontSize: '12px', color: '#666', marginBottom: '10px' }}>
+                  Progress: {currentPointIndex} / {totalPoints} points
+                </div>
+              )}
 
               {/* Map Viewport */}
               <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '10px' }}>
