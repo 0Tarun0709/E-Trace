@@ -228,6 +228,7 @@ function App() {
         isAnimating={isPlaying}
         isRealTime={false}
         onPositionUpdate={handlePositionUpdate}
+        onBoundaryViolation={handleBoundaryViolation}
         autoFitEnabled={autoFitEnabled}
         fitNowVersion={fitNowVersion}
       />

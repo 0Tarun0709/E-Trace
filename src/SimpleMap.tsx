@@ -68,6 +68,9 @@ interface SimpleMapProps {
   onPositionUpdate?: (elephantId: string, coordinates: { x: number, y: number }, timestamp?: number) => void;
   isAnimating?: boolean;
   currentPointIndex?: number;
+  // Viewport controls
+  autoFitEnabled?: boolean;
+  fitNowVersion?: number;
 }
 
 const SimpleMap: React.FC<SimpleMapProps> = ({ 
@@ -80,7 +83,9 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
   currentPointIndex = 0,
   isRealTime = false,
   boundaryData,
-  elephantsInBoundary = []
+  elephantsInBoundary = [],
+  autoFitEnabled = false,
+  fitNowVersion
 }) => {
   const mapRef = useRef<L.Map | null>(null);
   const mapContainerRef = useRef<HTMLDivElement>(null);
@@ -95,6 +100,7 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
   const boundaryCircleRef = useRef<L.Circle | null>(null);
   const lastModeRef = useRef('');
   const hasFitBoundsRef = useRef(false);
+  const lastFitNowVersionRef = useRef<number | undefined>(undefined);
 
   // Initialize map (run once)
   useEffect(() => {
@@ -291,14 +297,13 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
         markersRef.current.push(refMarker);
 
         // 1.1. Add green boundary circle (500m radius)
-        // CHANGE CIRCLE CENTER LOCATION
-        boundaryCircleRef.current = L.circle([referencePoint.lat, referencePoint.lng+0.031], {
+        boundaryCircleRef.current = L.circle([referencePoint.lat, referencePoint.lng], {
           color: '#22c55e',
           weight: 3,
           opacity: 0.8,
           fillColor: '#22c55e',
           fillOpacity: 0.1,
-          radius: 5000 // 500 meters radius
+          radius: 5000 // meters
         }).addTo(mapRef.current);
         
         boundaryCircleRef.current.bindPopup('🟢 Tracking Boundary (500m radius)');
@@ -378,10 +383,18 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
           
           // Check boundary violation (500m radius from reference point)
           if (onBoundaryViolation) {
-            // Use the same coordinate transformation as the coordinate system
-            // The coordinate system translates: (raw_x - 800) * 10 for meters
-            const transformedX = (currentObj.x - 800) * 10; // meters from center
-            const transformedY = (currentObj.y - 500) * 10; // meters from center (assuming y center ~500)
+            // In static mode, App has already transformed coordinates to meters offset from center.
+            // In realtime (frameBasedData), fall back to translating around (800,500) using scale (meters per unit).
+            let transformedX: number;
+            let transformedY: number;
+            if (trackingData && !frameBasedData) {
+              transformedX = currentObj.x; // already meters from center
+              transformedY = currentObj.y; // already meters from center
+            } else {
+              const mPerUnit = (scale && typeof scale.metersPerUnit === 'number') ? scale.metersPerUnit : 1;
+              transformedX = (currentObj.x - 800) * mPerUnit;
+              transformedY = (currentObj.y - 500) * mPerUnit;
+            }
             
             const distanceFromCenter = Math.sqrt(
               Math.pow(transformedX, 2) + Math.pow(transformedY, 2)
@@ -467,8 +480,10 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
           console.log(`🐘 Elephant ${elephantId} updated:`, isInBoundary ? 'RED (in boundary)' : 'normal', `with ${finalTrail.length} trail points`);
         });
 
-        // 6. Fit bounds only once per dataset load (avoid flicker on pause/updates)
-        if (!hasFitBoundsRef.current) {
+        // 6. Fit bounds based on controls
+        const shouldManualFit = typeof fitNowVersion === 'number' && fitNowVersion !== lastFitNowVersionRef.current;
+        const shouldAutoFit = autoFitEnabled;
+        if (!hasFitBoundsRef.current || shouldAutoFit || shouldManualFit) {
           const boundCoords: [number, number][] = [];
           elephantPathsRef.current.forEach((path) => {
             boundCoords.push(...path);
@@ -479,6 +494,9 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
           const group = L.featureGroup(boundCoords.map(coord => L.marker(coord)));
           mapRef.current.fitBounds(group.getBounds().pad(0.1));
           hasFitBoundsRef.current = true;
+          if (shouldManualFit) {
+            lastFitNowVersionRef.current = fitNowVersion;
+          }
         }
         
         console.log(`✅ UPDATED: Multi-elephant tracking (${elephantGroups.size} elephants), Objects: ${visibleObjectCount}`);
