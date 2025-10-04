@@ -71,6 +71,8 @@ interface SimpleMapProps {
   // Viewport controls
   autoFitEnabled?: boolean;
   fitNowVersion?: number;
+  // Unified boundary radius (meters) used both for circle and violation logic
+  boundaryRadiusMeters?: number;
 }
 
 const SimpleMap: React.FC<SimpleMapProps> = ({ 
@@ -85,7 +87,8 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
   boundaryData,
   elephantsInBoundary = [],
   autoFitEnabled = false,
-  fitNowVersion
+  fitNowVersion,
+  boundaryRadiusMeters = 500
 }) => {
   const mapRef = useRef<L.Map | null>(null);
   const mapContainerRef = useRef<HTMLDivElement>(null);
@@ -296,18 +299,18 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
           .bindPopup('📍 Reference Point');
         markersRef.current.push(refMarker);
 
-        // 1.1. Add green boundary circle (500m radius)
+        // 1.1. Add green boundary circle with unified radius
         boundaryCircleRef.current = L.circle([referencePoint.lat, referencePoint.lng], {
           color: '#22c55e',
           weight: 3,
           opacity: 0.8,
           fillColor: '#22c55e',
           fillOpacity: 0.1,
-          radius: 5000 // meters
+          radius: boundaryRadiusMeters // meters
         }).addTo(mapRef.current);
         
-        boundaryCircleRef.current.bindPopup('🟢 Tracking Boundary (500m radius)');
-        console.log('🟢 Boundary circle added to map: 500m radius');
+        boundaryCircleRef.current.bindPopup(`🟢 Tracking Boundary (${boundaryRadiusMeters}m radius)`);
+        console.log(`🟢 Boundary circle added to map: ${boundaryRadiusMeters}m radius`);
 
         // 2. Process objects to build elephant trails
         const elephantGroups = new Map<string, FrameObject[]>();
@@ -381,7 +384,7 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
           const currentCoords = localToLatLng(currentObj.x, currentObj.y);
           const currentPoint = [currentCoords.lat, currentCoords.lng] as [number, number];
           
-          // Check boundary violation (500m radius from reference point)
+          // Check boundary violation (radius from reference point)
           if (onBoundaryViolation) {
             // In static mode, App has already transformed coordinates to meters offset from center.
             // In realtime (frameBasedData), fall back to translating around (800,500) using scale (meters per unit).
@@ -400,10 +403,10 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
               Math.pow(transformedX, 2) + Math.pow(transformedY, 2)
             );
             
-            const isOutsideBoundary = distanceFromCenter > 500; // 500m radius
+            const isOutsideBoundary = distanceFromCenter > boundaryRadiusMeters; // unified radius
             
             // Debug logging
-            console.log(`🐘 ${elephantId}: pos(${currentObj.x}, ${currentObj.y}) -> transformed(${transformedX.toFixed(1)}, ${transformedY.toFixed(1)}) -> distance: ${distanceFromCenter.toFixed(1)}m, outside: ${isOutsideBoundary}`);
+            console.log(`🐘 ${elephantId}: pos(${currentObj.x}, ${currentObj.y}) -> transformed(${transformedX.toFixed(1)}, ${transformedY.toFixed(1)}) -> distance: ${distanceFromCenter.toFixed(1)}m, outside: ${isOutsideBoundary}, radius=${boundaryRadiusMeters}m`);
             
             onBoundaryViolation(elephantId, isOutsideBoundary, { x: currentObj.x, y: currentObj.y });
           }
@@ -437,11 +440,25 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
           elephantPolyline.bindPopup(`🐘 Elephant ${elephantId} Trail (${finalTrail.length} points)`);
           elephantTrailsRef.current.set(elephantId, elephantPolyline);
 
-          // Create/update marker for this elephant
-          // Check if this elephant is in boundary (red alert)
-          const isInBoundary = elephantsInBoundary.includes(elephantId);
-          const elephantColor = isInBoundary ? '🔴' : '🐘';
-          const markerColor = isInBoundary ? '#ff0000' : trailColor;
+          // Create/update marker for this elephant using computed boundary status
+          const elephantIsOutside = (() => {
+            // Recompute minimal distance using same logic as above to color marker
+            let tx: number;
+            let ty: number;
+            if (trackingData && !frameBasedData) {
+              tx = currentObj.x;
+              ty = currentObj.y;
+            } else {
+              const mPerUnit = (scale && typeof scale.metersPerUnit === 'number') ? scale.metersPerUnit : 1;
+              tx = (currentObj.x - 800) * mPerUnit;
+              ty = (currentObj.y - 500) * mPerUnit;
+            }
+            const d = Math.sqrt(tx * tx + ty * ty);
+            return d > boundaryRadiusMeters;
+          })();
+
+          const elephantColor = elephantIsOutside ? '🔴' : '🐘';
+          const markerColor = elephantIsOutside ? '#ff0000' : trailColor;
           
           const elephantIcon = L.divIcon({
             className: 'elephant-marker',
@@ -450,9 +467,9 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
             iconAnchor: [15, 15],
           });
 
-          const popupText = isInBoundary 
-            ? `🚨 ALERT: Elephant ${elephantId} in restricted area! - Objects: ${visibleObjectCount}/${currentData.objects.length} (Trail: ${finalTrail.length} pts)`
-            : `🐘 Elephant ${elephantId} - Objects: ${visibleObjectCount}/${currentData.objects.length} (Trail: ${finalTrail.length} pts)`;
+          const popupText = elephantIsOutside 
+            ? `🚨 ALERT: Elephant ${elephantId} OUTSIDE (>${boundaryRadiusMeters}m) - Objects: ${visibleObjectCount}/${currentData.objects.length} (Trail: ${finalTrail.length} pts)`
+            : `🐘 Elephant ${elephantId} (≤${boundaryRadiusMeters}m) - Objects: ${visibleObjectCount}/${currentData.objects.length} (Trail: ${finalTrail.length} pts)`;
 
           // Remove existing marker for this elephant
           if (elephantMarkersRef.current.has(elephantId) && mapRef.current) {
@@ -477,7 +494,7 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
             elephantStartMarkersRef.current.set(elephantId, startMarker);
           }
           
-          console.log(`🐘 Elephant ${elephantId} updated:`, isInBoundary ? 'RED (in boundary)' : 'normal', `with ${finalTrail.length} trail points`);
+          console.log(`🐘 Elephant ${elephantId} updated:`, elephantIsOutside ? 'OUTSIDE' : 'inside', `with ${finalTrail.length} trail points`);
         });
 
         // 6. Fit bounds based on controls

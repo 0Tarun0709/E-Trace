@@ -22,6 +22,8 @@ function App() {
   // Map viewport controls
   const [autoFitEnabled, setAutoFitEnabled] = useState(false)
   const [fitNowVersion, setFitNowVersion] = useState(0)
+  // Boundary radius (meters)
+  const [boundaryRadius, setBoundaryRadius] = useState<number>(500)
   
   // Elephant position tracking for E1 and E2
   const [elephantPositions, setElephantPositions] = useState<{
@@ -231,6 +233,7 @@ function App() {
         onBoundaryViolation={handleBoundaryViolation}
         autoFitEnabled={autoFitEnabled}
         fitNowVersion={fitNowVersion}
+        boundaryRadiusMeters={boundaryRadius}
       />
       
 
@@ -368,6 +371,20 @@ function App() {
                 >
                   Fit now
                 </button>
+              </div>
+
+              {/* Boundary Radius */}
+              <div style={{ display: 'flex', gap: '8px', alignItems: 'center', marginBottom: '10px' }}>
+                <label style={{ fontSize: '12px', color: '#374151' }}>Boundary radius (m):</label>
+                <input
+                  type="number"
+                  min={50}
+                  max={10000}
+                  step={50}
+                  value={boundaryRadius}
+                  onChange={(e) => setBoundaryRadius(Number(e.target.value) || 0)}
+                  style={{ width: '90px', padding: '4px 6px', fontSize: '12px' }}
+                />
               </div>
 
               {/* Trail Toggle */}
