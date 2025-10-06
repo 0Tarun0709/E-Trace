@@ -18,6 +18,20 @@ from datetime import datetime
 import logging
 import argparse
 import os
+from typing import Dict, List, Set, Tuple, Optional
+
+# Optional Twilio import (gracefully handle missing dependency)
+try:
+    from twilio.rest import Client as TwilioClient
+except Exception:  # pragma: no cover
+    TwilioClient = None  # type: ignore
+
+# Optional .env loader
+try:
+    from dotenv import load_dotenv  # type: ignore
+    load_dotenv()  # loads variables from a .env file in current directory if present
+except Exception:
+    pass
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -59,10 +73,42 @@ class RealTimeElephantTracker:
         # Video capture
         self.cap = None
         self.fps = 30
+        self.frame_width = 0
+        self.frame_height = 0
         self.frame_count = 0
         self.start_time = None
         self.is_running = False
         self.headless = False
+
+        # Boundary circles (each acts like a mesh node): [{ id, center:{lat,lng}, radius }]
+        self.boundary_circles: List[Dict] = []
+        # Track which circles each elephant is currently inside
+        self.elephant_inside_circles: Dict[int, Set[str]] = {}
+        # SMS cooldown tracker to avoid spamming: key=(elephant_id, circle_id) -> last_sent_epoch
+        self._last_sms_sent: Dict[Tuple[int, str], float] = {}
+        self.SMS_COOLDOWN_SECONDS = float(os.getenv("SMS_COOLDOWN_SECONDS", "120"))
+
+        # Twilio configuration from environment
+        self.TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
+        self.TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
+        self.TWILIO_PHONE_NUMBER = os.getenv('TWILIO_PHONE_NUMBER')
+        self.TWILIO_MESSAGING_SERVICE_SID = os.getenv('TWILIO_MESSAGING_SERVICE_SID')  # optional
+        # Comma-separated recipient list, e.g. "+254700000000,+254711111111"
+        self.ALERT_RECIPIENTS = [x.strip() for x in os.getenv('ALERT_RECIPIENTS', '').split(',') if x.strip()]
+
+        # Twilio client instance (if configured)
+        self.twilio_client = None
+        if self.TWILIO_ACCOUNT_SID and self.TWILIO_AUTH_TOKEN and self.TWILIO_PHONE_NUMBER:
+            if TwilioClient is not None:
+                try:
+                    self.twilio_client = TwilioClient(self.TWILIO_ACCOUNT_SID, self.TWILIO_AUTH_TOKEN)
+                    logger.info("Twilio client initialized for SMS alerts")
+                except Exception as e:  # pragma: no cover
+                    logger.warning(f"Failed to initialize Twilio client: {e}")
+            else:
+                logger.warning("twilio package not installed. Run: pip install twilio")
+        else:
+            logger.info("Twilio env vars not fully set; SMS alerts disabled (set TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER)")
         
         logger.info("Real-time Elephant Tracker initialized")
 
@@ -143,9 +189,122 @@ class RealTimeElephantTracker:
         frame_width = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         frame_height = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        self.frame_width = frame_width
+        self.frame_height = frame_height
         
         logger.info(f"Video loaded: {frame_width}x{frame_height}, {self.fps} FPS, {total_frames} frames")
         return True
+
+    def _pixels_to_latlng(self, x_px: float, y_px: float) -> Tuple[float, float]:
+        """Convert pixel coordinates to lat/lng using camera reference and scale.
+        Uses the frame center as origin (0,0), maps pixels to meters via metersPerUnit.
+        """
+        rp = self.CAMERA_CONFIG["referencePoint"]
+        meters_per_unit = float(self.CAMERA_CONFIG["scale"].get("metersPerUnit", 1))
+        # Offset from center of frame (origin)
+        cx = self.frame_width / 2.0
+        cy = self.frame_height / 2.0
+        x_m = (x_px - cx) * meters_per_unit
+        y_m = (y_px - cy) * meters_per_unit
+        # Meters to degrees
+        lat_offset = y_m / 111_320.0
+        lng_offset = x_m / (111_320.0 * np.cos(rp["lat"] * np.pi / 180.0))
+        return (rp["lat"] + lat_offset, rp["lng"] + lng_offset)
+
+    def _detect_circle_exits_and_alert(self, elephant_id: int, lat: float, lng: float):
+        """Compute circle membership for current position and send SMS on exits."""
+        if not self.boundary_circles:
+            return
+        prev_inside = self.elephant_inside_circles.get(elephant_id, set())
+        current_inside: Set[str] = set()
+
+        for bc in self.boundary_circles:
+            cid = str(bc.get('id'))
+            center = bc.get('center', {})
+            radius = float(bc.get('radius', 0))
+            c_lat = float(center.get('lat', 0))
+            c_lng = float(center.get('lng', 0))
+            d_lat_m = (lat - c_lat) * 111_320.0
+            d_lng_m = (lng - c_lng) * 111_320.0 * np.cos(c_lat * np.pi / 180.0)
+            dist = float(np.sqrt(d_lat_m * d_lat_m + d_lng_m * d_lng_m))
+            if dist <= radius:
+                current_inside.add(cid)
+
+        # Exits and entries
+        exited = [cid for cid in prev_inside if cid not in current_inside]
+        entered = [cid for cid in current_inside if cid not in prev_inside]
+        # Update state
+        self.elephant_inside_circles[elephant_id] = current_inside
+
+        for cid in exited:
+            self._maybe_send_exit_sms(elephant_id, cid)
+            try:
+                logger.info(f"Elephant {elephant_id} EXITED circle {self._get_circle_label(cid)} ({cid})")
+            except Exception:
+                pass
+        for cid in entered:
+            try:
+                logger.info(f"Elephant {elephant_id} ENTERED circle {self._get_circle_label(cid)} ({cid})")
+            except Exception:
+                pass
+
+    def _get_circle_label(self, circle_id: str) -> str:
+        """Return a human-friendly label for a circle: name if present, else id."""
+        for bc in self.boundary_circles:
+            try:
+                if str(bc.get('id')) == str(circle_id):
+                    name = bc.get('name')
+                    if isinstance(name, str) and name.strip():
+                        return name.strip()
+                    return str(circle_id)
+            except Exception:
+                continue
+        return str(circle_id)
+
+    def _maybe_send_exit_sms(self, elephant_id: int, circle_id: str):
+        now = time.time()
+        key = (elephant_id, circle_id)
+        last = self._last_sms_sent.get(key, 0)
+        if now - last < self.SMS_COOLDOWN_SECONDS:
+            logger.debug(f"Cooldown active for elephant {elephant_id} / circle {circle_id}; skipping SMS")
+            return
+        self._last_sms_sent[key] = now
+
+        node_label = self._get_circle_label(circle_id)
+        msg = f"\U0001F418 ELEPHANT ALERT from node {node_label}: Elephant {elephant_id} exited this zone. Alert ID: alert-{int(now*1000)}"
+        self._broadcast_sms(msg)
+
+    def _broadcast_sms(self, message: str):
+        if not self.twilio_client:
+            logger.info(f"SMS (disabled): {message}")
+            return
+        if not self.ALERT_RECIPIENTS:
+            logger.warning("No ALERT_RECIPIENTS configured; cannot send SMS")
+            return
+        successes = 0
+        for to in self.ALERT_RECIPIENTS:
+            # Guard: Twilio error 21266 if To == From
+            if self.TWILIO_PHONE_NUMBER and to.strip() == self.TWILIO_PHONE_NUMBER.strip():
+                logger.warning(f"Skipping SMS: 'To' and 'From' are the same ({to}). Configure ALERT_RECIPIENTS to a different number.")
+                continue
+            try:
+                if self.TWILIO_MESSAGING_SERVICE_SID:
+                    m = self.twilio_client.messages.create(
+                        body=message,
+                        messaging_service_sid=self.TWILIO_MESSAGING_SERVICE_SID,
+                        to=to,
+                    )
+                else:
+                    m = self.twilio_client.messages.create(
+                        body=message,
+                        from_=self.TWILIO_PHONE_NUMBER,
+                        to=to,
+                    )
+                logger.info(f"SMS sent to {to}: sid={m.sid}")
+                successes += 1
+            except Exception as e:  # pragma: no cover
+                logger.error(f"Failed to send SMS to {to}: {e}")
+        logger.info(f"SMS batch complete: {successes}/{len(self.ALERT_RECIPIENTS)} succeeded")
 
     async def process_video_frame(self):
         """Process a single video frame and return tracking data"""
@@ -206,6 +365,11 @@ class RealTimeElephantTracker:
                     'confidence': confidence,
                     'timestamp': current_timestamp
                 })
+
+                # If boundary circles are configured, compute current lat/lng and check exits
+                if self.boundary_circles:
+                    lat, lng = self._pixels_to_latlng(center_x, center_y)
+                    self._detect_circle_exits_and_alert(int(tracker_id), lat, lng)
         
         # Store tracking data
         self.all_tracking_data.append(frame_data)
@@ -356,15 +520,80 @@ class RealTimeElephantTracker:
                 cfg = data.get('config', {})
                 rp = cfg.get('referencePoint')
                 sc = cfg.get('scale')
+                bcircles = cfg.get('boundaryCircles')
                 if isinstance(rp, dict) and 'lat' in rp and 'lng' in rp:
                     self.CAMERA_CONFIG['referencePoint'] = { 'lat': float(rp['lat']), 'lng': float(rp['lng']) }
                 if isinstance(sc, dict) and 'metersPerUnit' in sc:
                     self.CAMERA_CONFIG['scale'] = { 'metersPerUnit': float(sc['metersPerUnit']) }
+                # Optional: set/update boundary circles (list of { id, center:{lat,lng}, radius })
+                if isinstance(bcircles, list):
+                    safe_list = []
+                    for bc in bcircles:
+                        try:
+                            cid = str(bc.get('id'))
+                            c = bc.get('center', {})
+                            lat = float(c.get('lat'))
+                            lng = float(c.get('lng'))
+                            r = float(bc.get('radius'))
+                            name = bc.get('name') if isinstance(bc.get('name'), str) else None
+                            safe_list.append({ 'id': cid, 'name': name, 'center': { 'lat': lat, 'lng': lng }, 'radius': r })
+                        except Exception:
+                            continue
+                    self.boundary_circles = safe_list
+                    # Reset inside-tracking for fresh evaluation
+                    self.elephant_inside_circles = {}
+                    try:
+                        summary = ", ".join([f"{b.get('id')}\u2192{(b.get('name') or '').strip() or b.get('id')}" for b in safe_list])
+                        logger.info(f"Updated boundary circles: {summary}")
+                    except Exception:
+                        pass
                 await self.send_to_client(websocket, {
                     "type": "command_response",
-                    "data": {"status": "config_updated", "config": self.CAMERA_CONFIG}
+                    "data": {
+                        "status": "config_updated",
+                        "config": self.CAMERA_CONFIG,
+                        "boundaryCircles": self.boundary_circles
+                    }
                 })
                 
+            elif command == 'send_test_exit':
+                # Force an SMS for a given circle to validate pipeline
+                circle_id = str(data.get('circle_id') or '')
+                elephant_id = int(data.get('elephant_id') or 1)
+                ignore_cooldown = bool(data.get('ignoreCooldown') or False)
+                if ignore_cooldown:
+                    # reset cooldown so it will send now
+                    try:
+                        self._last_sms_sent.pop((elephant_id, circle_id), None)
+                    except Exception:
+                        pass
+                if circle_id:
+                    self._maybe_send_exit_sms(elephant_id, circle_id)
+                    await self.send_to_client(websocket, {
+                        "type": "command_response",
+                        "data": {"status": "test_exit_sent", "circle_id": circle_id, "elephant_id": elephant_id}
+                    })
+                else:
+                    await self.send_to_client(websocket, {
+                        "type": "command_response",
+                        "data": {"status": "error", "error": "circle_id required"}
+                    })
+
+            elif command == 'send_sms':
+                # Send an arbitrary SMS message (from UI alerts)
+                msg = data.get('message')
+                if isinstance(msg, str) and msg.strip():
+                    self._broadcast_sms(msg.strip())
+                    await self.send_to_client(websocket, {
+                        "type": "command_response",
+                        "data": {"status": "sms_sent", "length": len(msg.strip())}
+                    })
+                else:
+                    await self.send_to_client(websocket, {
+                        "type": "command_response",
+                        "data": {"status": "error", "error": "message required"}
+                    })
+
             elif command == 'get_status':
                 await self.send_to_client(websocket, {
                     "type": "status",
@@ -405,6 +634,10 @@ async def main():
     parser.add_argument('--port', type=int, default=8765, help='WebSocket port (default: 8765)')
     parser.add_argument('--autostart', action='store_true', help='Automatically start tracking on launch')
     parser.add_argument('--headless', action='store_true', help='Disable OpenCV window (no GUI)')
+    parser.add_argument('--test-sms', action='store_true', help='Send a test SMS to ALERT_RECIPIENTS and exit')
+    parser.add_argument('--boundary-center', type=str, help='Single boundary center as "lat,lng" (e.g., -1.2921,34.7617)')
+    parser.add_argument('--boundary-radius', type=float, help='Single boundary radius in meters (e.g., 500)')
+    parser.add_argument('--circles', type=str, help='Path to JSON file with boundaryCircles list: [{ id, center:{lat,lng}, radius }]')
     args = parser.parse_args()
 
     if args.video:
@@ -419,6 +652,68 @@ async def main():
     logger.info("🐘 Real-time Elephant Tracking Server running!")
     logger.info(f"📡 WebSocket server: ws://{args.host}:{args.port}")
     logger.info("🎥 Ready to process video and send live updates")
+    
+    if args.test_sms:
+        tracker._broadcast_sms("✅ Test SMS from RealTimeElephantTracker")
+        return
+
+    # Initialize boundary circles from CLI/env for automatic SMS alerts
+    # Priority: --circles JSON > --boundary-* CLI > ENV > none
+    initialized_circles = False
+    if args.circles:
+        try:
+            with open(args.circles, 'r') as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                safe_list = []
+                for bc in data:
+                    try:
+                        cid = str(bc.get('id'))
+                        c = bc.get('center', {})
+                        lat = float(c.get('lat'))
+                        lng = float(c.get('lng'))
+                        r = float(bc.get('radius'))
+                        safe_list.append({ 'id': cid, 'center': { 'lat': lat, 'lng': lng }, 'radius': r })
+                    except Exception:
+                        continue
+                tracker.boundary_circles = safe_list
+                initialized_circles = True
+                logger.info(f"Loaded {len(safe_list)} boundary circles from {args.circles}")
+        except Exception as e:
+            logger.error(f"Failed to load circles from {args.circles}: {e}")
+
+    if not initialized_circles and args.boundary_center and args.boundary_radius:
+        try:
+            lat_str, lng_str = [x.strip() for x in args.boundary_center.split(',')]
+            lat = float(lat_str)
+            lng = float(lng_str)
+            tracker.boundary_circles = [{ 'id': 'home', 'center': { 'lat': lat, 'lng': lng }, 'radius': float(args.boundary_radius) }]
+            initialized_circles = True
+            logger.info(f"Using single boundary circle at ({lat},{lng}) radius {args.boundary_radius}m")
+        except Exception as e:
+            logger.error(f"Invalid --boundary-center format. Expected 'lat,lng'. Error: {e}")
+
+    if not initialized_circles:
+        # Try ENV-based single boundary
+        env_lat = os.getenv('BOUNDARY_CENTER_LAT')
+        env_lng = os.getenv('BOUNDARY_CENTER_LNG')
+        env_r = os.getenv('BOUNDARY_RADIUS_M')
+        if env_lat and env_lng and env_r:
+            try:
+                tracker.boundary_circles = [{
+                    'id': 'home',
+                    'center': { 'lat': float(env_lat), 'lng': float(env_lng) },
+                    'radius': float(env_r)
+                }]
+                initialized_circles = True
+                logger.info(f"Using ENV boundary circle at ({env_lat},{env_lng}) radius {env_r}m")
+            except Exception as e:
+                logger.error(f"Invalid ENV boundary values: {e}")
+
+    if initialized_circles:
+        # Reset inside tracking to start fresh
+        tracker.elephant_inside_circles = {}
+        logger.info(f"Boundary circles active ({len(tracker.boundary_circles)}). SMS alerts on exit enabled.")
     
     async with websockets.serve(handle_client, args.host, args.port):
         logger.info("Server started successfully!")

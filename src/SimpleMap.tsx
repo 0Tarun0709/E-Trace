@@ -67,6 +67,7 @@ interface SimpleMapProps {
   onBoundaryViolation?: (elephantId: string, isViolation: boolean, coordinates: { x: number, y: number }) => void;
   onPositionUpdate?: (elephantId: string, coordinates: { x: number, y: number }, timestamp?: number) => void;
   onCircleEntry?: (elephantId: string, circleId: string) => void;
+  onCircleExit?: (elephantId: string, circleId: string) => void;
   isAnimating?: boolean;
   currentPointIndex?: number;
   // Viewport controls
@@ -87,6 +88,7 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
   onBoundaryViolation,
   onPositionUpdate,
   onCircleEntry,
+  onCircleExit,
   isAnimating = false,
   currentPointIndex = 0,
   isRealTime = false,
@@ -481,10 +483,15 @@ const SimpleMap: React.FC<SimpleMapProps> = ({
             if (boundaryCircles && boundaryCircles.length > 0) {
               const prevInside = elephantInsideCirclesRef.current.get(elephantId) || new Set<string>();
               const newlyEntered: string[] = [];
+              const newlyExited: string[] = [];
               currentInsideSet.forEach((cid) => { if (!prevInside.has(cid)) newlyEntered.push(cid); });
+              prevInside.forEach((cid) => { if (!currentInsideSet.has(cid)) newlyExited.push(cid); });
               elephantInsideCirclesRef.current.set(elephantId, currentInsideSet);
               if (newlyEntered.length > 0 && typeof onCircleEntry === 'function') {
                 newlyEntered.forEach(cid => onCircleEntry(elephantId, cid));
+              }
+              if (newlyExited.length > 0 && typeof onCircleExit === 'function') {
+                newlyExited.forEach(cid => onCircleExit(elephantId, cid));
               }
             }
           }

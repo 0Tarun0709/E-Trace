@@ -4,6 +4,11 @@ import { ObjectTrackingData } from './ObjectTrackingLayer'
 import './App.css'
 
 function App() {
+  // Demo contacts list for SMS alerts (replace with real numbers in E.164 format)
+  const CONTACTS: Array<{ id: string; name: string; role: 'farmer'|'officer'; phone: string }> = [
+    // Example: { id: '1', name: 'Farmer A', role: 'farmer', phone: '+254700000000' },
+  ]
+
   const [isLoading, setIsLoading] = useState(true)
   const [trackingData, setTrackingData] = useState<ObjectTrackingData | null>(null)
   const [showTrails, setShowTrails] = useState(true)
@@ -36,6 +41,77 @@ function App() {
   const [lastRealtimeTs, setLastRealtimeTs] = useState<number | null>(null)
   const [frameBasedData, setFrameBasedData] = useState<any | null>(null)
 
+  // Tracker WS integration (to push boundary circles/nodes)
+  const [trackerWsUrl, setTrackerWsUrl] = useState<string>('ws://localhost:8765')
+  const [lastSyncStatus, setLastSyncStatus] = useState<string>('')
+
+  // Send a one-off WS command to the Python tracker
+  const sendTrackerCommand = async (payload: any): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      try {
+        const ws = new WebSocket(trackerWsUrl)
+        const timeout = setTimeout(() => {
+          try { ws.close() } catch {}
+          reject(new Error('Tracker WS timeout'))
+        }, 5000)
+        ws.onopen = () => {
+          ws.send(JSON.stringify(payload))
+        }
+        ws.onmessage = (ev) => {
+          try {
+            const txt = typeof ev.data === 'string' ? ev.data : ''
+            const obj = txt ? JSON.parse(txt) : null
+            if (obj && obj.type === 'command_response') {
+              clearTimeout(timeout)
+              resolve(txt)
+              try { ws.close() } catch {}
+            }
+            // Ignore other messages like initial 'config'
+          } catch {
+            // ignore parse errors
+          }
+        }
+        ws.onerror = () => {
+          clearTimeout(timeout)
+          reject(new Error('Tracker WS error'))
+        }
+      } catch (e) {
+        reject(e as any)
+      }
+    })
+  }
+
+  const syncNodesToTracker = async () => {
+    try {
+      const config = {
+        referencePoint: boundaryCenter || DEFAULT_REFERENCE_POINT,
+        scale: { metersPerUnit: realtimeMetersPerUnit },
+        boundaryCircles: boundaryCircles.map(c => ({ id: c.id, name: c.name, center: c.center, radius: c.radius }))
+      }
+      const payload = { command: 'set_config', config }
+      setLastSyncStatus('Syncing...')
+      const resp = await sendTrackerCommand(payload)
+      setLastSyncStatus('✅ Synced nodes to tracker')
+      setMessage('✅ Synced boundary circles to tracker')
+      console.log('Tracker response:', resp)
+    } catch (e) {
+      console.error(e)
+      setLastSyncStatus('❌ Sync failed')
+      setError('Failed to sync nodes to tracker (check WS URL and server)')
+    }
+  }
+
+  // Forward an alert message to the tracker to send SMS
+  const sendAlertSmsViaTracker = async (message: string) => {
+    try {
+      const payload = { command: 'send_sms', message }
+      await sendTrackerCommand(payload)
+    } catch (e) {
+      console.error('Failed to send alert SMS via tracker:', e)
+      // Non-blocking: we still show the alert in UI even if SMS fails
+    }
+  }
+
   // Lock reference point for both static and realtime to avoid map center drift
   const DEFAULT_REFERENCE_POINT = { lat: -1.2921, lng: 34.7617 }
   // Realtime scale: tune this down; default 1 meter per unit (pixel)
@@ -53,6 +129,29 @@ function App() {
     setElephantPositions({})
     setElephantsOutsideBoundary(new Set())
     setIdToLabel(new Map())
+  }
+
+  // Minimal direct call to Supabase Edge Function (verify_jwt=false)
+  async function sendSmsAlertDirect({
+    contacts,
+    message,
+    alertId,
+  }: {
+    contacts: Array<{ id: string; name: string; phone: string; role: string }>
+    message: string
+    alertId: string
+  }) {
+    const url = 'https://axxaiaplxbjnynlamhpf.functions.supabase.co/send-sms'
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ contacts, message, alertId }),
+    })
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '')
+      throw new Error(`send-sms failed: ${res.status} ${errText}`)
+    }
+    return res.json()
   }
 
 
@@ -109,6 +208,8 @@ function App() {
       setBoundaryAlerts(prev => [...prev.slice(-4), alertMessage]) // Keep last 5 alerts
       setMessage(alertMessage)
       console.warn(alertMessage)
+      // Forward this UI alert as an SMS via tracker Twilio path
+      sendAlertSmsViaTracker(alertMessage)
     } else if (!isViolation && elephantsOutsideBoundary.has(key)) {
       // Elephant returned to the boundary
       setElephantsOutsideBoundary(prev => {
@@ -379,6 +480,21 @@ function App() {
           const msg = `✅ ${elephantId} has entered circle ${label}`
           setBoundaryAlerts(prev => [...prev.slice(-4), msg])
           setMessage(msg)
+          // Optional: send SMS for entries as well (comment out if not needed)
+          // sendAlertSmsViaTracker(msg)
+        }}
+        onCircleExit={async (elephantId, circleId) => {
+          // Node == circle; form the same alert message and forward to tracker for SMS
+          const circle = boundaryCircles.find(c => c.id === circleId)
+          const nodeLabel = circle?.name || circleId
+          const alertId = `alert-${Date.now()}`
+          const uiLabel = idToLabel.get(elephantId) || (elephantId as any)
+          const msg = `🐘 ELEPHANT ALERT from node ${nodeLabel}: ${uiLabel} exited this zone. Alert ID: ${alertId}`
+
+          setBoundaryAlerts(prev => [...prev.slice(-4), `🚨 Exited ${nodeLabel}: ${uiLabel}`])
+          setMessage(`🚨 ${uiLabel} exited ${nodeLabel}`)
+          // Send through the tracker Twilio path (mirrors --test-sms)
+          sendAlertSmsViaTracker(msg)
         }}
         autoFitEnabled={autoFitEnabled}
         fitNowVersion={fitNowVersion}
@@ -627,6 +743,28 @@ function App() {
                 >
                   Clear all
                 </button>
+                <button
+                  onClick={syncNodesToTracker}
+                  disabled={boundaryCircles.length === 0}
+                  title="Send current circles to Python tracker via WebSocket"
+                  style={{ padding: '4px 8px', backgroundColor: boundaryCircles.length === 0 ? '#ccc' : '#2563eb', color: 'white', border: 'none', borderRadius: '4px', cursor: boundaryCircles.length === 0 ? 'not-allowed' : 'pointer', fontSize: '12px' }}
+                >
+                  Sync nodes to Tracker
+                </button>
+              </div>
+              {/* Tracker WS controls */}
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr auto', gap: '8px', alignItems: 'center', marginBottom: '10px' }}>
+                <input
+                  type="text"
+                  value={trackerWsUrl}
+                  onChange={(e) => setTrackerWsUrl(e.target.value)}
+                  placeholder="ws://localhost:8765"
+                  title="Tracker WebSocket URL"
+                  style={{ padding: '4px 6px', fontSize: '12px', border: '1px solid #ddd', borderRadius: '4px' }}
+                />
+                <span style={{ fontSize: '12px', color: lastSyncStatus.startsWith('✅') ? '#10b981' : (lastSyncStatus.startsWith('❌') ? '#ef4444' : '#6b7280') }}>
+                  {lastSyncStatus || 'Ready'}
+                </span>
               </div>
               {boundaryCircles.length > 0 && (
                 <div style={{ marginBottom: '10px', border: '1px solid #e5e7eb', borderRadius: '8px', padding: '8px', background: '#f9fafb' }}>
