@@ -1,3 +1,3 @@
-DOCUMENTATION in pregress
+DOCUMENTATION in progress
 
 Installation, USAGE and DEMO, will be Updated Soon...
